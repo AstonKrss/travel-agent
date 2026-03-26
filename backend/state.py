@@ -46,10 +46,11 @@ class TravelState(BaseModel):
     trip: TripInfo = Field(default_factory=TripInfo)
     recommendations: List[RecommendationItem] = Field(default_factory=list)
     order: OrderInfo = Field(default_factory=OrderInfo)
-    current_step: str = "initial"  # initial, extracted, recommended, booking, completed
+    current_step: str = "initial"
     extracted: bool = False
     need_recommendation: bool = False
     last_message: Optional[str] = None
+    conversation_summary: Optional[str] = Field(default=None, description="对话摘要")
 
     class Config:
         arbitrary_types_allowed = True

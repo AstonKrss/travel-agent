@@ -34,14 +34,17 @@ class InformationExtractionTool(BaseTool):
             "people": r"(\d+)\s*(人|位|个人)",
         }
 
-        # Extract departure
-        from_match = re.search(patterns["from"], user_input, re.IGNORECASE)
+        # Extract departure - first try "从X到Y" pattern
+        from_match = re.search(
+            r"从\s*([一-\u9fa5A-Za-z]+?)\s*到\s*([一-\u9fa5A-Za-z]+)", user_input
+        )
         if from_match:
-            result.departure = from_match.group(2).strip()
+            result.departure = from_match.group(1).strip()
+            result.destination = from_match.group(2).strip()
         else:
             # Check for pattern like "北京到广州" or "北京,到,广州" or "北京到广州，下周二"
             simple_match = re.match(
-                r"^([一-\u9fa5A-Za-z]+)\s*[,，]?\s*(到|to)\s*[,，]?\s*([一-\u9fa5A-Za-z]+)",
+                r"^([一-\u9fa5A-Za-z]+?)\s*[,，]?\s*(到|to)\s*[,，]?\s*([一-\u9fa5A-Za-z]+?)(?:下周一|下周二|下周三|下周四|下周五|下周六|下周日|\d{4}[-/]\d{1,2}[-/]\d{1,2})?$",
                 user_input,
             )
             if simple_match:
@@ -53,6 +56,15 @@ class InformationExtractionTool(BaseTool):
             to_match = re.search(patterns["to"], user_input, re.IGNORECASE)
             if to_match:
                 result.destination = to_match.group(2).strip()
+
+        # 如果目的地包含日期（如"北京下周二"），需要分离
+        if result.destination:
+            date_in_dest = re.search(
+                r"(.+?)(下周一|下周二|下周三|下周四|下周五|下周六|下周日)$",
+                result.destination,
+            )
+            if date_in_dest:
+                result.destination = date_in_dest.group(1).strip()
 
         # Extract date
         date_match = re.search(patterns["date"], user_input, re.IGNORECASE)
