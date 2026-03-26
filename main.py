@@ -1,9 +1,12 @@
 import uuid
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import json
+import asyncio
 
 from backend.state import TravelState
 from backend.graph import travel_graph
@@ -49,6 +52,123 @@ class BookRequest(BaseModel):
     date: Optional[str] = None
     user_id: str
     thread_id: str
+
+
+@app.get("/")
+async def root():
+    return {"message": "Enterprise Travel Agent System API"}
+
+
+async def generate_chat_response(
+    request: ChatRequest, thread_id: str
+) -> AsyncGenerator[str, None]:
+    """生成流式响应"""
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # 立即发送开始消息，让用户知道请求已接收
+    yield f"data: {json.dumps({'type': 'start', 'thread_id': thread_id, 'message': '正在连接...'})}\n\n"
+    await asyncio.sleep(0.1)
+
+    # 获取现有状态
+    existing_state = None
+    try:
+        existing = travel_graph.get_state(config)
+        if existing and existing.values:
+            existing_state = existing.values
+    except Exception as e:
+        print(f"获取历史状态失败: {e}")
+
+    # 发送正在处理消息
+    yield f"data: {json.dumps({'type': 'message', 'content': '正在处理您的请求...'})}\n\n"
+    await asyncio.sleep(0.3)
+
+    # 构建状态
+    if existing_state:
+        new_messages = existing_state.get("messages", []) + [
+            {"role": "user", "content": request.message}
+        ]
+
+        from backend.state import TripInfo, OrderInfo
+
+        trip_data = existing_state.get("trip", {})
+        trip = (
+            TripInfo(**trip_data)
+            if isinstance(trip_data, dict)
+            else (trip_data or TripInfo())
+        )
+
+        order_data = existing_state.get("order", {})
+        order = (
+            OrderInfo(**order_data)
+            if isinstance(order_data, dict)
+            else (order_data or OrderInfo())
+        )
+
+        state = TravelState(
+            user_id=request.user_id,
+            thread_id=thread_id,
+            messages=new_messages,
+            last_message=request.message,
+            trip=trip,
+            order=order,
+            extracted=existing_state.get("extracted", False),
+            need_recommendation=existing_state.get("need_recommendation", False),
+            current_step=existing_state.get("current_step", "initial"),
+            recommendations=existing_state.get("recommendations", []),
+            conversation_summary=existing_state.get("conversation_summary"),
+        )
+    else:
+        state = TravelState(
+            user_id=request.user_id,
+            thread_id=thread_id,
+            messages=[{"role": "user", "content": request.message}],
+            last_message=request.message,
+        )
+
+    yield f"data: {json.dumps({'type': 'message', 'content': '正在调用 AI...'})}\n\n"
+
+    try:
+        final_state = travel_graph.invoke(state.model_dump(), config)
+
+        # 清除"正在处理"消息，显示真实回复
+        yield f"data: {json.dumps({'type': 'clear'})}\n\n"
+
+        # 流式输出每条消息
+        for msg in final_state.get("messages", []):
+            if msg.get("role") == "assistant":
+                content = msg["content"]
+                # 逐段输出，模拟打字效果
+                for i in range(0, len(content), 20):
+                    chunk = content[i : i + 20]
+                    yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0.03)
+
+        # 输出推荐结果
+        recommendations = final_state.get("recommendations", [])
+        if recommendations:
+            yield f"data: {json.dumps({'type': 'recommendations', 'data': [r.model_dump() if hasattr(r, 'model_dump') else r for r in recommendations]})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done', 'step': final_state.get('current_step', 'initial')})}\n\n"
+
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """流式聊天接口"""
+    thread_id = request.thread_id or str(uuid.uuid4())
+
+    return StreamingResponse(
+        generate_chat_response(request, thread_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Thread-Id": thread_id,  # 返回 thread_id
+        },
+    )
 
 
 @app.get("/")

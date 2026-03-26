@@ -32,56 +32,81 @@ async function sendMessage() {
     
     if (!message) return;
     
-    // Hide welcome message on first message
     document.getElementById('welcomeMessage').style.display = 'none';
     
     addMessage(message, 'user');
     inputEl.value = '';
     inputEl.style.height = 'auto';
     
-    setStatus('Processing your request...');
+    setStatus('正在处理...');
     
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/chat`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                message: message,
-                user_id: userId,
-                thread_id: currentThreadId
-            }),
-        });
+    // 创建流式请求
+    const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            message: message,
+            user_id: userId,
+            thread_id: currentThreadId
+        }),
+    });
+    
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let messageContainer = null;
+    
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
         
-        const data = await response.json();
-        currentThreadId = data.thread_id;
+        buffer += decoder.decode(value, { stream: true });
         
-        // Add assistant messages
-        let hasAssistantMessage = false;
-        data.messages.forEach(msg => {
-            if (msg.role === 'assistant') {
-                addMessage(msg.content, 'assistant');
-                hasAssistantMessage = true;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    
+                    if (data.type === 'start') {
+                        currentThreadId = data.thread_id || currentThreadId;
+                        setStatus('正在思考...');
+                    } else if (data.type === 'message') {
+                        // 如果还没有消息容器，创建并添加到界面
+                        if (!messageContainer) {
+                            const messagesContainer = document.getElementById('messages');
+                            messageContainer = document.createElement('div');
+                            messageContainer.className = 'message assistant';
+                            messageContainer.textContent = '';
+                            messagesContainer.appendChild(messageContainer);
+                        }
+                        // 追加内容
+                        messageContainer.textContent += data.content;
+                        setStatus('正在输入...');
+                    } else if (data.type === 'clear') {
+                        // 清除占位消息
+                        if (messageContainer) {
+                            messageContainer.remove();
+                            messageContainer = null;
+                        }
+                    } else if (data.type === 'recommendations') {
+                        displayRecommendations(data.data, userId, currentThreadId);
+                    } else if (data.type === 'done') {
+                        setStatus('完成');
+                        messageContainer = null;
+                    } else if (data.type === 'error') {
+                        addMessage('抱歉，出了点问题: ' + data.message, 'assistant');
+                    }
+                } catch (e) {}
             }
-        });
-        
-        // Display recommendations if any
-        if (data.recommendations && data.recommendations.length > 0) {
-            displayRecommendations(data.recommendations, userId, currentThreadId);
-        } else {
-            document.getElementById('recommendations').innerHTML = '';
         }
-        
-        setStatus(`Ready`);
-        
-        // Scroll to bottom
-        scrollToBottom();
-    } catch (error) {
-        console.error('Error:', error);
-        setStatus('Error: Failed to send message');
-        addMessage('Sorry, there was an error processing your request.', 'assistant');
     }
+    
+    scrollToBottom();
 }
 
 function addMessage(content, role) {
