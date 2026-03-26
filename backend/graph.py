@@ -1,48 +1,93 @@
-from typing import Literal, TypedDict
+from typing import Literal
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
 from backend.state import TravelState
-from tools.information_extraction import InformationExtractionTool, ExtractedInfo
+from tools.information_extraction import InformationExtractionTool
 from tools.travel_recommendation import TravelRecommendationTool
-from tools.tmc_api import TMCApiTool, TMCBookingResult
-from tools.oa_finance import OAFinanceTool
 
-import json
+SYSTEM_PROMPT = """你是一个企业差旅智能助手，专门帮助员工安排出差行程。
 
-# Initialize tools
-tools = [
-    InformationExtractionTool(),
-    TravelRecommendationTool(),
-    TMCApiTool(),
-    OAFinanceTool(),
-]
+你的职责：
+1. 友好地与用户对话，询问差旅需求
+2. 引导用户提供：出发城市、目的地、出行日期、人数等信息
+3. 根据用户需求推荐合适的火车、航班和酒店
+4. 协助完成预订流程
 
-tool_node = ToolNode(tools)
+回复要求：
+- 使用中文回复
+- 语气友好、专业、简洁
+- 主动引导用户说明目的地和日期
+- 如果用户问你是谁，告诉用户你是企业差旅智能助手"""
 
 
-def should_continue(state: TravelState) -> Literal["tools", END]:
-    """Determine if we should continue or end the current loop"""
-    messages = state.messages
-    last_message = messages[-1]
+def call_llm(messages: list, system_prompt: str = SYSTEM_PROMPT) -> str:
+    """调用LLM API，带超时处理"""
+    import threading
 
-    if "tool_calls" in last_message and last_message["tool_calls"]:
-        return "tools"
+    result = [None]
+    error = [None]
 
-    return END
+    def _call():
+        try:
+            from backend.llm import get_llm
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            llm = get_llm(timeout=30)
+
+            langchain_msgs = [SystemMessage(content=system_prompt)]
+            for msg in messages:
+                if msg["role"] == "user":
+                    langchain_msgs.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    langchain_msgs.append({"type": "ai", "content": msg["content"]})
+
+            response = llm.invoke(langchain_msgs)
+            result[0] = (
+                response.content if hasattr(response, "content") else str(response)
+            )
+        except Exception as e:
+            error[0] = e
+
+    # 用线程避免阻塞
+    t = threading.Thread(target=_call)
+    t.daemon = True
+    t.start()
+    t.join(timeout=35)
+
+    if result[0]:
+        return result[0]
+    if error[0]:
+        print(f"[LLM调用失败] {type(error[0]).__name__}: {error[0]}")
+    return None
+
+
+def recommendation_node(state: TravelState) -> dict:
+    """Node that calls the travel recommendation tool"""
+    rec_tool = TravelRecommendationTool()
+    recommendations = rec_tool._run(
+        departure=state.trip.departure,
+        destination=state.trip.destination,
+        travel_date=state.trip.date,
+        passengers=state.trip.passengers,
+    )
+
+    response_text = f"为您找到了从 {state.trip.departure} 到 {state.trip.destination} 的出行方案。请选择以下选项："
+
+    return {
+        "recommendations": [item.model_dump() for item in recommendations],
+        "current_step": "recommended",
+        "messages": state.messages + [{"role": "assistant", "content": response_text}],
+    }
 
 
 def agent_node(state: TravelState) -> dict:
     """Main agent decision and execution node"""
 
     if not state.extracted and state.last_message:
-        # First step: always extract information
         ie_tool = InformationExtractionTool()
         extracted = ie_tool._run(state.last_message)
 
-        # Create a completely new TripInfo object to avoid validation issues
         new_trip = state.trip.model_copy()
         new_trip.departure = extracted.departure
         new_trip.destination = extracted.destination
@@ -63,16 +108,24 @@ def agent_node(state: TravelState) -> dict:
             and extracted.date
         ):
             updates["need_recommendation"] = True
-            response_text = f"I've extracted your trip info: {extracted.departure} to {extracted.destination} on {extracted.date}. I'll now find recommendations for you."
+            # 优先用LLM
+            llm_resp = call_llm(
+                state.messages + [{"role": "user", "content": state.last_message}]
+            )
+            if llm_resp:
+                response_text = llm_resp
+            else:
+                response_text = f"好的，已为您记录出行信息：{extracted.departure} → {extracted.destination}，{extracted.date}。正在为您查找推荐方案..."
         else:
-            missing = []
-            if not extracted.departure:
-                missing.append("departure city")
-            if not extracted.destination:
-                missing.append("destination city")
-            if not extracted.date:
-                missing.append("travel date")
-            response_text = f"I need more information: Please provide {', '.join(missing)} for your trip."
+            # 信息不完整，用LLM引导用户
+            llm_resp = call_llm(
+                state.messages + [{"role": "user", "content": state.last_message}]
+            )
+            if llm_resp:
+                response_text = llm_resp
+            else:
+                response_text = "好的，请问您计划什么时候出发？去哪个城市出差呢？请告诉我目的地和出行日期。"
+
             updates["need_recommendation"] = False
 
         updates["messages"] = state.messages + [
@@ -82,7 +135,6 @@ def agent_node(state: TravelState) -> dict:
         return updates
 
     if state.need_recommendation and not state.recommendations:
-        # Second step: generate recommendations
         rec_tool = TravelRecommendationTool()
         recommendations = rec_tool._run(
             departure=state.trip.departure,
@@ -91,7 +143,7 @@ def agent_node(state: TravelState) -> dict:
             passengers=state.trip.passengers,
         )
 
-        response_text = f"Here are your travel recommendations from {state.trip.departure} to {state.trip.destination} on {state.trip.date.isoformat()}. Please select an option below:"
+        response_text = f"为您找到了从 {state.trip.departure} 到 {state.trip.destination} 的出行方案。请选择以下选项："
 
         return {
             "recommendations": [item.model_dump() for item in recommendations],
@@ -100,41 +152,42 @@ def agent_node(state: TravelState) -> dict:
             + [{"role": "assistant", "content": response_text}],
         }
 
-    # If booking is completed
-    if (
-        state.order.ticket_booked or state.order.hotel_booked
-    ) and state.order.status == "booked":
-        # Update finance system
-        oa_tool = OAFinanceTool()
-        result = oa_tool._run(
-            order_id=state.order.order_id,
-            user_id=state.user_id,
-            status=state.order.status,
-            amount=state.order.total_amount,
-        )
-
-        response_text = f"""✅ Booking completed successfully! 
-
-Order ID: {state.order.order_id}
-Amount charged to company account: ¥{state.order.total_amount:.2f}
-Expense report created: {result.expense_id}
-
-You can proceed directly to check-in / boarding with your ID. No payment needed from you. The finance system has been automatically updated."""
-
+    # 其他情况优先用LLM
+    llm_resp = call_llm(
+        state.messages + [{"role": "user", "content": state.last_message}]
+    )
+    if llm_resp:
         return {
-            "current_step": "completed",
-            "messages": state.messages
-            + [{"role": "assistant", "content": response_text}],
+            "messages": state.messages + [{"role": "assistant", "content": llm_resp}]
         }
 
-    return {"messages": state.messages}
+    # Fallback中文回复
+    if state.extracted and not state.need_recommendation:
+        response_text = (
+            "好的，请问您计划什么时候出发？去哪个城市出差呢？请告诉我目的地和出行日期。"
+        )
+    elif state.current_step == "recommended":
+        response_text = "请问您需要选择哪个方案？"
+    else:
+        response_text = "您好！我是企业差旅智能助手，请告诉我您的出行需求。"
+
+    return {
+        "messages": state.messages + [{"role": "assistant", "content": response_text}]
+    }
+
+
+def should_continue(state: TravelState) -> Literal["recommendation", "end"]:
+    """判断是否需要继续到推荐节点"""
+    if state.need_recommendation and not state.recommendations:
+        return "recommendation"
+    return "end"
 
 
 # Build the graph
 workflow = StateGraph(TravelState)
 
 workflow.add_node("agent", agent_node)
-workflow.add_node("tools", tool_node)
+workflow.add_node("recommendation", recommendation_node)
 
 workflow.set_entry_point("agent")
 
@@ -142,12 +195,11 @@ workflow.add_conditional_edges(
     "agent",
     should_continue,
     {
-        "tools": "tools",
-        END: END,
+        "recommendation": "recommendation",
+        "end": END,
     },
 )
-workflow.add_edge("tools", "agent")
+workflow.add_edge("recommendation", END)
 
-# Compile with memory for persistence
 memory = MemorySaver()
 travel_graph = workflow.compile(checkpointer=memory)

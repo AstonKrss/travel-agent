@@ -39,9 +39,10 @@ class InformationExtractionTool(BaseTool):
         if from_match:
             result.departure = from_match.group(2).strip()
         else:
-            # Check for pattern like "北京到广州"
+            # Check for pattern like "北京到广州" or "北京,到,广州" or "北京到广州，下周二"
             simple_match = re.match(
-                r"^([一-\u9fa5A-Za-z]+)\s*(到|to)\s*([一-\u9fa5A-Za-z]+)", user_input
+                r"^([一-\u9fa5A-Za-z]+)\s*[,，]?\s*(到|to)\s*[,，]?\s*([一-\u9fa5A-Za-z]+)",
+                user_input,
             )
             if simple_match:
                 result.departure = simple_match.group(1).strip()
@@ -57,11 +58,47 @@ class InformationExtractionTool(BaseTool):
         date_match = re.search(patterns["date"], user_input, re.IGNORECASE)
         if date_match:
             date_str = date_match.group(0)
-            # Handle "next Monday" style
-            if "下周一" in date_str:
-                # Calculate next Monday from today
+
+            # Map day names to weekday numbers (Monday=0, Sunday=6)
+            day_map = {
+                "周一": 0,
+                "周一": 0,
+                "星期一": 0,
+                "周一": 0,
+                "周二": 1,
+                "星期二": 1,
+                "周三": 2,
+                "星期三": 2,
+                "周四": 3,
+                "星期四": 3,
+                "周五": 4,
+                "星期五": 4,
+                "周六": 5,
+                "星期六": 5,
+                "周日": 6,
+                "星期天": 6,
+                "周日": 6,
+            }
+
+            # Handle "下周一" style
+            if (
+                "下周一" in date_str
+                or "下周二" in date_str
+                or "下周三" in date_str
+                or "下周四" in date_str
+                or "下周五" in date_str
+                or "下周六" in date_str
+                or "下周日" in date_str
+                or "下周" in date_str
+            ):
                 today = datetime.now().date()
-                days_ahead = 0 - today.weekday() + 7
+                # Find next occurrence of the day
+                weekday = 0
+                for k, v in day_map.items():
+                    if k in date_str:
+                        weekday = v
+                        break
+                days_ahead = weekday - today.weekday()
                 if days_ahead <= 0:
                     days_ahead += 7
                 result.date = today + timedelta(days=days_ahead)
@@ -69,6 +106,10 @@ class InformationExtractionTool(BaseTool):
                 result.date = datetime.strptime(
                     date_str.replace("/", "-"), "%Y-%m-%d"
                 ).date()
+            elif "明天" in date_str:
+                result.date = (datetime.now() + timedelta(days=1)).date()
+            elif "后天" in date_str:
+                result.date = (datetime.now() + timedelta(days=2)).date()
             else:
                 # Default to tomorrow for other cases
                 tomorrow = datetime.now().date() + timedelta(days=1)

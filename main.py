@@ -59,18 +59,59 @@ async def root():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
-
-    # Initialize state
-    state = TravelState(
-        user_id=request.user_id,
-        thread_id=thread_id,
-        messages=[{"role": "user", "content": request.message}],
-        last_message=request.message,
-    )
-
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Invoke the graph
+    # Try to get existing state
+    existing_state = None
+    try:
+        existing = travel_graph.get_state(config)
+        if existing and existing.values:
+            existing_state = existing.values
+    except Exception as e:
+        print(f"获取历史状态失败: {e}")
+
+    if existing_state:
+        # Continue existing conversation
+        new_messages = existing_state.get("messages", []) + [
+            {"role": "user", "content": request.message}
+        ]
+
+        # Build updated state
+        from backend.state import TripInfo, OrderInfo
+
+        trip_data = existing_state.get("trip", {})
+        if isinstance(trip_data, dict):
+            trip = TripInfo(**trip_data)
+        else:
+            trip = trip_data or TripInfo()
+
+        order_data = existing_state.get("order", {})
+        if isinstance(order_data, dict):
+            order = OrderInfo(**order_data)
+        else:
+            order = order_data or OrderInfo()
+
+        state = TravelState(
+            user_id=request.user_id,
+            thread_id=thread_id,
+            messages=new_messages,
+            last_message=request.message,
+            trip=trip,
+            order=order,
+            extracted=existing_state.get("extracted", False),
+            need_recommendation=existing_state.get("need_recommendation", False),
+            current_step=existing_state.get("current_step", "initial"),
+            recommendations=existing_state.get("recommendations", []),
+        )
+    else:
+        # New conversation
+        state = TravelState(
+            user_id=request.user_id,
+            thread_id=thread_id,
+            messages=[{"role": "user", "content": request.message}],
+            last_message=request.message,
+        )
+
     final_state = travel_graph.invoke(state.model_dump(), config)
 
     return ChatResponse(
