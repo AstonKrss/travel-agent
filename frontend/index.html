@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>企业差旅智能 Agent</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Sidebar - Left -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">✈️</div>
+            <h1>差旅 Agent</h1>
+        </div>
+
+        <div class="sidebar-menu">
+            <div class="menu-item active">
+                <span class="icon">💬</span>
+                <span>Chat</span>
+            </div>
+            <div class="menu-item">
+                <span class="icon">🔍</span>
+                <span>Search</span>
+            </div>
+            <div class="menu-item">
+                <span class="icon">🎤</span>
+                <span>Voice</span>
+            </div>
+            <div class="menu-item">
+                <span class="icon">📋</span>
+                <span>My Orders</span>
+            </div>
+        </div>
+
+        <div class="sidebar-footer">
+            <div class="user-info-card">
+                <label for="userId">Current User ID</label>
+                <input type="text" id="userId" value="emp001" placeholder="Enter user ID">
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content - Right -->
+    <div class="main-container">
+        <div id="chatContainer" class="chat-container">
+            <div class="welcome-message" id="welcomeMessage">
+                <h2>✈️ 企业差旅智能 Agent</h2>
+                <p>一站式智能差旅解决方案，员工无需垫付，自动完成申请-预订-报销全流程</p>
+                <div class="quick-prompts">
+                    <div class="quick-prompt" onclick="useQuickPrompt('北京到上海下周一')">北京到上海下周一</div>
+                    <div class="quick-prompt" onclick="useQuickPrompt('广州到深圳明天走')">广州到深圳明天走</div>
+                    <div class="quick-prompt" onclick="useQuickPrompt('成都到北京下周二需要住宿')">成都到北京下周二住宿</div>
+                </div>
+            </div>
+            <div id="messages" class="messages"></div>
+        </div>
+
+        <div id="recommendations" class="recommendations-container"></div>
+
+        <div class="input-container">
+            <div class="input-wrapper">
+                <textarea 
+                    id="messageInput" 
+                    placeholder="Type your travel request... (e.g. 北京到广州 下周一)" 
+                    rows="1"
+                ></textarea>
+                <button id="voiceBtn" onclick="startVoiceInput()" title="Voice input">🎤</button>
+                <button id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+            </div>
+            <div id="status" class="status-bar">Ready</div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
