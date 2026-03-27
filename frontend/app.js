@@ -75,6 +75,9 @@ async function sendMessage() {
                     if (data.type === 'start') {
                         currentThreadId = data.thread_id || currentThreadId;
                         setStatus('正在思考...');
+                        // 清除之前的推荐卡片
+                        document.getElementById('recommendations').style.display = 'none';
+                        document.getElementById('recommendations-list').innerHTML = '';
                     } else if (data.type === 'status') {
                         // 显示状态消息，不创建消息容器
                         setStatus(data.message);
@@ -108,8 +111,17 @@ async function sendMessage() {
                             messageContainer.remove();
                             messageContainer = null;
                         }
-                    } else if (data.type === 'recommendations') {
-                        displayRecommendations(data.data, userId, currentThreadId);
+                    } else if (data.type === 'recommendation_category') {
+                        // 显示推荐分类标题
+                        document.getElementById('recommendations').style.display = 'block';
+                        displayRecommendationCategory(data.category, data.title);
+                    } else if (data.type === 'recommendation') {
+                        // 流式显示单个推荐卡片
+                        document.getElementById('recommendations').style.display = 'block';
+                        displaySingleRecommendation(data.data, userId, currentThreadId);
+                    } else if (data.type === 'recommendations_done') {
+                        // 推荐显示完成
+                        setStatus('请选择出行方案');
                     } else if (data.type === 'done') {
                         setStatus('完成');
                         messageContainer = null;
@@ -199,6 +211,102 @@ function displayRecommendations(recommendations, userId, threadId) {
     scrollToBottom();
 }
 
+function displayRecommendationCategory(category, title) {
+    const container = document.getElementById('recommendations-list');
+    const categoryEl = document.createElement('div');
+    categoryEl.className = 'recommendation-category';
+    categoryEl.textContent = title;
+    container.appendChild(categoryEl);
+    scrollToBottom();
+}
+
+function displaySingleRecommendation(rec, userId, threadId) {
+    const container = document.getElementById('recommendations-list');
+    const card = document.createElement('div');
+    card.className = 'recommendation-card';
+    
+    let content = `
+        <span class="type-badge ${rec.type}">${rec.type.toUpperCase()}</span>
+        <h3>${rec.name}</h3>
+    `;
+    
+    if (rec.departure && rec.destination) {
+        content += `
+            <div class="info-row">
+                <span>From</span>
+                <span>${rec.departure}</span>
+            </div>
+            <div class="info-row">
+                <span>To</span>
+                <span>${rec.destination}</span>
+            </div>
+        `;
+    }
+    
+    if (rec.departure_time && rec.arrival_time) {
+        content += `
+            <div class="info-row">
+                <span>Departure</span>
+                <span>${rec.departure_time}</span>
+            </div>
+            <div class="info-row">
+                <span>Arrival</span>
+                <span>${rec.arrival_time}</span>
+            </div>
+            <div class="info-row">
+                <span>Duration</span>
+                <span>${rec.duration}</span>
+            </div>
+        `;
+    }
+    
+    if (rec.details && rec.details.rating) {
+        content += `
+            <div class="info-row">
+                <span>Rating</span>
+                <span>${rec.details.rating} ⭐</span>
+            </div>
+        `;
+    }
+    
+    content += `
+        <div class="price">¥${rec.price.toFixed(2)}</div>
+        <button class="book-btn" onclick="bookItem('${rec.type}', '${rec.id}', '${rec.departure || ''}', '${rec.destination || ''}', '${rec.date || ''}', '${userId}', '${threadId}')">
+            Book Now
+        </button>
+    `;
+    
+    card.innerHTML = content;
+    card.style.animation = 'slideIn 0.3s ease-out';
+    container.appendChild(card);
+    scrollToBottom();
+}
+
+function createRecommendationCard(rec, userId, threadId) {
+    const card = document.createElement('div');
+    card.className = 'recommendation-card-inline';
+    
+    let content = `
+        <span class="type-badge ${rec.type}">${rec.type.toUpperCase()}</span>
+        <span class="rec-name">${rec.name}</span>
+    `;
+    
+    if (rec.departure_time && rec.arrival_time) {
+        content += `
+            <span class="rec-time">${rec.departure_time} → ${rec.arrival_time}</span>
+        `;
+    }
+    
+    if (rec.duration) {
+        content += `<span class="rec-duration">${rec.duration}</span>`;
+    }
+    
+    content += `<span class="rec-price">¥${rec.price.toFixed(2)}</span>`;
+    
+    card.innerHTML = content;
+    return card;
+}
+
 async function bookItem(type, id, departure, destination, date, userId, threadId) {
     const requestData = {
         action: "book",
@@ -285,6 +393,11 @@ function startVoiceInput() {
     };
     
     recognition.start();
+}
+
+function hideRecommendations() {
+    document.getElementById('recommendations').style.display = 'none';
+    document.getElementById('recommendations-list').innerHTML = '';
 }
 
 function scrollToBottom() {

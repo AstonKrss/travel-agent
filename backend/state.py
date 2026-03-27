@@ -1,19 +1,66 @@
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
-from datetime import date
+from typing import Optional, List, Dict, Any, Union
+from enum import Enum
+from pydantic import BaseModel, Field, field_serializer, field_validator
+from datetime import date, datetime
+
+
+class IntentType(str, Enum):
+    TRIP_QUERY = "trip_query"
+    BOOK = "book"
+    CANCEL = "cancel"
+    CHANGE = "change"
+    EXPENSE = "expense"
+    CHAT = "chat"
+    GREETING = "greeting"
+    UNKNOWN = "unknown"
 
 
 class TripInfo(BaseModel):
     departure: Optional[str] = None
     destination: Optional[str] = None
-    date: Optional[date] = None
-    return_date: Optional[date] = None
+    date: Union[date, datetime, None] = None
+    return_date: Union[date, datetime, None] = None
     passengers: int = 1
     trip_type: str = "one_way"
     preferences: Optional[Dict[str, Any]] = None
     user_input: Optional[str] = None
 
     model_config = {"arbitrary_types_allowed": True, "extra": "allow"}
+
+    @field_serializer("date")
+    def serialize_date(self, v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v.date().isoformat()
+        if isinstance(v, date):
+            return v.isoformat()
+        return str(v)
+
+    @field_serializer("return_date")
+    def serialize_return_date(self, v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v.date().isoformat()
+        if isinstance(v, date):
+            return v.isoformat()
+        return str(v)
+
+    @field_validator("date", "return_date", mode="before")
+    @classmethod
+    def parse_date(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (date, datetime)):
+            return v
+        if isinstance(v, str):
+            try:
+                for fmt in ["%Y-%m-%d", "%Y/%m/%d"]:
+                    return datetime.strptime(v, fmt).date()
+            except:
+                pass
+        return v
 
 
 class RecommendationItem(BaseModel):
@@ -54,6 +101,8 @@ class TravelState(BaseModel):
     extracted: bool = False
     need_recommendation: bool = False
     last_message: Optional[str] = None
+    intent: Optional[IntentType] = None
+    streaming_progress: str = ""
 
     class Config:
         arbitrary_types_allowed = True

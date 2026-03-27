@@ -205,10 +205,40 @@ async def generate_chat_response(
                 yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
                 await asyncio.sleep(0.03)
 
-        # 输出推荐结果
+        # 流式输出推荐结果 - 分段返回
         recommendations = final_state_dict.get("recommendations", [])
         if recommendations:
-            yield f"data: {json.dumps({'type': 'recommendations', 'data': [r.model_dump() if hasattr(r, 'model_dump') else r for r in recommendations]})}\n\n"
+            # 按类型分组
+            trains = [r for r in recommendations if r.get("type") == "train"]
+            flights = [r for r in recommendations if r.get("type") == "flight"]
+            hotels = [r for r in recommendations if r.get("type") == "hotel"]
+
+            # 流式输出高铁
+            if trains:
+                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'train', 'title': '🚄 高铁/动车'})}\n\n"
+                await asyncio.sleep(0.1)
+                for rec in trains:
+                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    await asyncio.sleep(0.15)
+
+            # 流式输出航班
+            if flights:
+                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'flight', 'title': '✈️ 航班'})}\n\n"
+                await asyncio.sleep(0.1)
+                for rec in flights:
+                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    await asyncio.sleep(0.15)
+
+            # 流式输出酒店
+            if hotels:
+                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'hotel', 'title': '🏨 酒店'})}\n\n"
+                await asyncio.sleep(0.1)
+                for rec in hotels:
+                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    await asyncio.sleep(0.15)
+
+            # 推荐完成信号
+            yield f"data: {json.dumps({'type': 'recommendations_done'})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done', 'step': final_state_dict.get('current_step', 'initial')})}\n\n"
 
