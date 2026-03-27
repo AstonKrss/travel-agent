@@ -78,9 +78,9 @@ async def generate_chat_response(
     except Exception as e:
         print(f"获取历史状态失败: {e}")
 
-    # 发送正在处理消息
-    yield f"data: {json.dumps({'type': 'message', 'content': '正在处理您的请求...'})}\n\n"
-    await asyncio.sleep(0.3)
+    # 发送状态消息（不会显示在聊天框）
+    yield f"data: {json.dumps({'type': 'status', 'message': '正在连接...'})}\n\n"
+    await asyncio.sleep(0.1)
 
     # 构建状态
     if existing_state:
@@ -91,18 +91,33 @@ async def generate_chat_response(
         from backend.state import TripInfo, OrderInfo
 
         trip_data = existing_state.get("trip", {})
-        trip = (
-            TripInfo(**trip_data)
-            if isinstance(trip_data, dict)
-            else (trip_data or TripInfo())
-        )
+        # 安全处理 trip，可能是 dict、Pydantic model 或其他
+        try:
+            if hasattr(trip_data, "model_dump"):
+                trip_dict = trip_data.model_dump()
+            elif isinstance(trip_data, dict):
+                trip_dict = trip_data
+            else:
+                trip_dict = {}
 
-        order_data = existing_state.get("order", {})
-        order = (
-            OrderInfo(**order_data)
-            if isinstance(order_data, dict)
-            else (order_data or OrderInfo())
-        )
+            # 处理 date 字段的序列化问题
+            if "date" in trip_dict and trip_dict["date"]:
+                pass
+            trip = TripInfo(**trip_dict)
+        except Exception as e:
+            print(f"创建 TripInfo 失败: {e}, trip_data: {trip_data}")
+            trip = TripInfo()
+
+        try:
+            order_data = existing_state.get("order", {})
+            if hasattr(order_data, "model_dump"):
+                order = OrderInfo(**order_data.model_dump())
+            elif isinstance(order_data, dict):
+                order = OrderInfo(**order_data)
+            else:
+                order = OrderInfo()
+        except:
+            order = OrderInfo()
 
         state = TravelState(
             user_id=request.user_id,
@@ -125,30 +140,77 @@ async def generate_chat_response(
             last_message=request.message,
         )
 
-    yield f"data: {json.dumps({'type': 'message', 'content': '正在调用 AI...'})}\n\n"
+    # 流式输出各阶段状态
+    yield f"data: {json.dumps({'type': 'status', 'message': '正在理解您的需求...'})}\n\n"
+    await asyncio.sleep(0.2)
+
+    yield f"data: {json.dumps({'type': 'status', 'message': '正在提取出行信息（出发地、目的地、日期）...'})}\n\n"
+    await asyncio.sleep(0.2)
 
     try:
         final_state = travel_graph.invoke(state.model_dump(), config)
 
-        # 清除"正在处理"消息，显示真实回复
+        # 转换为 dict 用于后续处理
+        final_state_dict = {}
+        for key, value in final_state.items():
+            if hasattr(value, "model_dump"):
+                final_state_dict[key] = value.model_dump()
+            else:
+                final_state_dict[key] = value
+
+        # 检查是否需要日期解析
+        need_date_llm = False
+        trip_info = final_state_dict.get("trip", {})
+        if isinstance(trip_info, dict):
+            if trip_info.get("date") is None:
+                need_date_llm = True
+
+        if need_date_llm:
+            yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 解析日期...'})}\n\n"
+            await asyncio.sleep(0.2)
+
+        if final_state_dict.get("need_recommendation") and not final_state_dict.get(
+            "recommendations"
+        ):
+            yield f"data: {json.dumps({'type': 'status', 'message': '正在搜索出行方案...'})}\n\n"
+            await asyncio.sleep(0.2)
+
+            yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 智能推荐（根据性价比）...'})}\n\n"
+            await asyncio.sleep(0.2)
+
+        # 检查 trip.date 是否存在
+        trip_data = final_state_dict.get("trip")
+        if trip_data and isinstance(trip_data, dict):
+            if trip_data.get("date") is None:
+                yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 解析日期...'})}\n\n"
+                await asyncio.sleep(0.2)
+
+        # 清除状态消息，准备显示回复
         yield f"data: {json.dumps({'type': 'clear'})}\n\n"
 
-        # 流式输出每条消息
-        for msg in final_state.get("messages", []):
+        # 只输出最新的助手消息，不重复历史
+        all_messages = final_state_dict.get("messages", [])
+
+        # 找到最新的一条助手消息
+        latest_response = None
+        for msg in reversed(all_messages):
             if msg.get("role") == "assistant":
-                content = msg["content"]
-                # 逐段输出，模拟打字效果
-                for i in range(0, len(content), 20):
-                    chunk = content[i : i + 20]
-                    yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
-                    await asyncio.sleep(0.03)
+                latest_response = msg.get("content", "")
+                break
+
+        if latest_response:
+            # 逐段输出，模拟打字效果
+            for i in range(0, len(latest_response), 20):
+                chunk = latest_response[i : i + 20]
+                yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
+                await asyncio.sleep(0.03)
 
         # 输出推荐结果
-        recommendations = final_state.get("recommendations", [])
+        recommendations = final_state_dict.get("recommendations", [])
         if recommendations:
             yield f"data: {json.dumps({'type': 'recommendations', 'data': [r.model_dump() if hasattr(r, 'model_dump') else r for r in recommendations]})}\n\n"
 
-        yield f"data: {json.dumps({'type': 'done', 'step': final_state.get('current_step', 'initial')})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'step': final_state_dict.get('current_step', 'initial')})}\n\n"
 
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"

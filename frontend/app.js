@@ -38,7 +38,7 @@ async function sendMessage() {
     inputEl.value = '';
     inputEl.style.height = 'auto';
     
-    setStatus('正在处理...');
+    // 不要立即设置状态，会被后续的 status 消息覆盖
     
     // 创建流式请求
     const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
@@ -75,7 +75,22 @@ async function sendMessage() {
                     if (data.type === 'start') {
                         currentThreadId = data.thread_id || currentThreadId;
                         setStatus('正在思考...');
+                    } else if (data.type === 'status') {
+                        // 显示状态消息，不创建消息容器
+                        setStatus(data.message);
                     } else if (data.type === 'message') {
+                        // 跳过重复的空消息
+                        if (!data.content || data.content.trim() === '') {
+                            continue;
+                        }
+                        
+                        // 检查是否与最后一条消息相同，避免重复
+                        const messages = document.querySelectorAll('.message.assistant');
+                        const lastMsg = messages[messages.length - 1];
+                        if (lastMsg && lastMsg.textContent === data.content) {
+                            continue;
+                        }
+                        
                         // 如果还没有消息容器，创建并添加到界面
                         if (!messageContainer) {
                             const messagesContainer = document.getElementById('messages');

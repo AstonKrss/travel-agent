@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Dict
 from pydantic import BaseModel, Field
 from langchain.tools import BaseTool
 from datetime import date
@@ -15,6 +15,108 @@ class RecommendationInput(BaseModel):
     passengers: int = Field(default=1, description="Number of passengers")
 
 
+LLM_PROMPT = """You are a travel consultant. Recommend top 3 from candidates based on user preference.
+
+User: {passengers} people, from {departure} to {destination}, date: {date}
+Preference: {preferences}
+
+Candidates:
+{candidates}
+
+Return JSON only:
+{{"recommendations": [{{"id": "ID", "reason": "reason"}}]}}"""
+
+
+def get_llm():
+    """Get LLM instance"""
+    try:
+        from langchain_openai import ChatOpenAI
+    except:
+        return None
+
+    if settings.llm_provider == "volcano":
+        return ChatOpenAI(
+            api_key=settings.volcano_api_key,
+            base_url=settings.volcano_base_url,
+            model=settings.volcano_model,
+            temperature=0.3,
+            timeout=15,
+        )
+    elif settings.llm_provider == "openai":
+        return ChatOpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            model=settings.openai_model,
+            temperature=0.3,
+            timeout=15,
+        )
+    return None
+
+
+def rank_with_llm(
+    candidates: List[RecommendationItem],
+    passengers: int,
+    departure: str,
+    destination: str,
+    travel_date: str,
+    preferences: str = "price-performance ratio",
+) -> tuple[List[RecommendationItem], Dict]:
+    """Use LLM to intelligently rank candidates"""
+
+    llm = get_llm()
+    if not llm:
+        return candidates[:5], {}
+
+    # Format candidates
+    txt = ""
+    for i, item in enumerate(candidates):
+        if item.type == "train":
+            txt += f"{i + 1}. [train] {item.name}, time: {item.departure_time}->{item.arrival_time}, duration: {item.duration}, price: {item.price}\n"
+        elif item.type == "flight":
+            txt += f"{i + 1}. [flight] {item.name}, time: {item.departure_time}->{item.arrival_time}, duration: {item.duration}, price: {item.price}\n"
+        elif item.type == "hotel":
+            r = item.details.get("rating", "N/A") if item.details else "N/A"
+            txt += f"{i + 1}. [hotel] {item.name}, rating: {r}, price: {item.price}/night\n"
+
+    prompt = LLM_PROMPT.format(
+        passengers=passengers,
+        departure=departure,
+        destination=destination,
+        date=travel_date,
+        preferences=preferences,
+        candidates=txt,
+    )
+
+    from langchain_core.messages import HumanMessage
+
+    try:
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        content = resp.content if hasattr(resp, "content") else str(resp)
+
+        import json, re
+
+        m = re.search(r"\{[\s\S]*\}", content)
+        if m:
+            result = json.loads(m.group())
+            ids = [r["id"] for r in result.get("recommendations", [])]
+            reasons = {r["id"]: r["reason"] for r in result.get("recommendations", [])}
+
+            ranked = []
+            for rid in ids:
+                for item in candidates:
+                    if item.id == rid:
+                        ranked.append(item)
+                        break
+            for item in candidates:
+                if item not in ranked:
+                    ranked.append(item)
+            return ranked[:5], reasons
+    except Exception as e:
+        print(f"LLM rank error: {e}")
+
+    return candidates[:5], {}
+
+
 class TravelRecommendationTool(BaseTool):
     name: str = "travel_recommendation"
     description: str = (
@@ -25,11 +127,8 @@ class TravelRecommendationTool(BaseTool):
     def _mock_recommendations(
         self, departure: str, destination: str, travel_date: date, passengers: int = 1
     ) -> List[RecommendationItem]:
-        """Mock implementation to generate travel recommendations when no TMC API configured"""
-
         recommendations = []
 
-        # High-speed train recommendations
         train_data = [
             {
                 "id": "G1",
@@ -60,7 +159,6 @@ class TravelRecommendationTool(BaseTool):
             },
         ]
 
-        # Flight recommendations
         flight_data = [
             {
                 "id": "CA1321",
@@ -82,7 +180,6 @@ class TravelRecommendationTool(BaseTool):
             },
         ]
 
-        # Hotel recommendations
         hotel_data = [
             {
                 "id": "HOTEL001",
@@ -100,7 +197,6 @@ class TravelRecommendationTool(BaseTool):
             },
         ]
 
-        # Add all to recommendations
         for item in train_data:
             recommendations.append(
                 RecommendationItem(
@@ -152,9 +248,7 @@ class TravelRecommendationTool(BaseTool):
     def _real_recommendations(
         self, departure: str, destination: str, travel_date: date, passengers: int = 1
     ) -> List[RecommendationItem]:
-        """Real implementation querying TMC API for actual availability and prices"""
         if not settings.tmc_api_base_url or not settings.tmc_api_key:
-            # Fall back to mock if not configured
             return self._mock_recommendations(
                 departure, destination, travel_date, passengers
             )
@@ -171,37 +265,54 @@ class TravelRecommendationTool(BaseTool):
                 "date": travel_date.isoformat(),
                 "passengers": passengers,
             }
-
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
-
-            recommendations = []
-            for item in data.get("results", []):
-                recommendations.append(RecommendationItem(**item))
-
-            return recommendations
+            return [RecommendationItem(**item) for item in data.get("results", [])]
         except Exception as e:
             print(f"TMC search error: {e}")
-            # Fall back to mock on error
             return self._mock_recommendations(
                 departure, destination, travel_date, passengers
             )
 
     def _run(
-        self, departure: str, destination: str, travel_date: date, passengers: int = 1
-    ) -> List[RecommendationItem]:
-        """Main entry point - uses mock if not configured, else real API"""
+        self,
+        departure: str,
+        destination: str,
+        travel_date: date,
+        passengers: int = 1,
+        preferences: str = None,
+    ) -> tuple[List[RecommendationItem], Dict]:
         if settings.use_mock or not settings.tmc_api_base_url:
-            return self._mock_recommendations(
+            candidates = self._mock_recommendations(
                 departure, destination, travel_date, passengers
             )
         else:
-            return self._real_recommendations(
+            candidates = self._real_recommendations(
                 departure, destination, travel_date, passengers
             )
 
+        if not candidates:
+            return [], {}
+
+        if preferences is None:
+            preferences = "price-performance ratio, suitable for business travel"
+
+        return rank_with_llm(
+            candidates,
+            passengers,
+            departure,
+            destination,
+            travel_date.isoformat(),
+            preferences,
+        )
+
     async def _arun(
-        self, departure: str, destination: str, travel_date: date, passengers: int = 1
-    ) -> List[RecommendationItem]:
-        return self._run(departure, destination, travel_date, passengers)
+        self,
+        departure: str,
+        destination: str,
+        travel_date: date,
+        passengers: int = 1,
+        preferences: str = None,
+    ) -> tuple[List[RecommendationItem], Dict]:
+        return self._run(departure, destination, travel_date, passengers, preferences)
