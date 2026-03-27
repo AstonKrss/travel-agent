@@ -27,6 +27,8 @@
 - 💾 **持久化对话**: 支持多轮对话，thread_id 保持会话上下文
 - 🔊 **语音输入**: 支持浏览器原生语音识别（中文）
 - 📡 **流式输出**: 实时流式响应，用户体验更佳
+- 🧠 **意图识别**: 自动识别用户意图（查询/预订/闲聊/问候）
+- 📱 **智能卡片**: 推荐卡片可关闭、可滚动。
 
 ---
 
@@ -100,6 +102,7 @@ cd frontend && python -m http.server 8080
 │                         Frontend (HTML/JS)                       │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │   聊天界面   │  │  推荐卡片   │  │    语音识别 (Web API)   │  │
+│  │  + 关闭按钮  │  │  (可滚动)   │  │                         │  │
 │  └──────┬──────┘  └──────┬──────┘  └───────────┬─────────────┘  │
 └─────────┼───────────────┼─────────────────────┼────────────────┘
           │               │                     │
@@ -110,10 +113,10 @@ cd frontend && python -m http.server 8080
 │  │                      /api/chat (SSE)                        ││
 │  │  ┌───────────────────────────────────────────────────────┐ ││
 │  │  │                   LangGraph Agent                     │ ││
-│  │  │  ┌──────────┐    ┌──────────┐    ┌──────────────────┐  │ ││
-│  │  │  │  Agent   │───▶│ Extract  │───▶│ Recommendation  │  │ ││
-│  │  │  │  Node    │    │   Tool   │    │      Tool        │  │ ││
-│  │  │  └──────────┘    └──────────┘    └──────────────────┘  │ ││
+│  │  │  ┌──────────┐    ┌──────────┐    ┌──────────────────┐│││
+│  │  │  │  Intent  │───▶│  Agent   │───▶│ Recommendation   ││││
+│  │  │  │ Classifier│    │  Node    │    │ (流式输出)        ││││
+│  │  │  └──────────┘    └──────────┘    └──────────────────┘│││
 │  │  └───────────────────────────────────────────────────────┘ ││
 │  └─────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
@@ -122,9 +125,9 @@ cd frontend && python -m http.server 8080
 ┌─────────────────────────────────────────────────────────────────┐
 │                          Tool Layer                              │
 │  ┌────────────────┐  ┌────────────────┐  ┌──────────────────┐  │
-│  │  Information   │  │     TMC        │  │      OA          │  │
-│  │  Extraction   │  │     API        │  │    Finance       │  │
-│  │    (正则/RE)   │  │  (公对公支付)   │  │   (报销入账)     │  │
+│  │ Information    │  │     TMC        │  │      OA          │  │
+│  │ Extraction     │  │     API        │  │    Finance       │  │
+│  │ (正则+LLM)     │  │  (公对公支付)   │  │   (报销入账)     │  │
 │  └────────────────┘  └────────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -133,22 +136,24 @@ cd frontend && python -m http.server 8080
 
 | 组件 | 技术栈 | 说明 |
 |------|--------|------|
+| **意图识别** | LLM | 自动判断用户意图（查询/预订/闲聊/问候） |
 | **状态机** | LangGraph | 差旅对话状态机，持久化管理多轮对话 |
-| **Agent** | Python | 决策与执行中心，调用 LLM 和工具 |
-| **工具层** | Pydantic + LangChain | 4 个核心工具（信息抽取、推荐、TMC、OA） |
+| **Agent** | Python | 决策中心，调用 LLM 和工具 |
+| **工具层** | Pydantic + LangChain | 4 个核心工具（意图、信息抽取、推荐、TMC） |
 | **后端** | FastAPI | RESTful API + SSE 流式输出 |
-| **前端** | 原生 HTML/CSS/JS | 简洁聊天界面，支持语音输入 |
+| **前端** | 原生 HTML/CSS/JS | 聊天界面 + 可滚动推荐卡片 |
 
 ### 工作流程
 
 ```
 1. 用户发送消息 → /api/chat/stream (SSE)
-2. Agent 接收消息 → 调用「信息抽取」Tool
-3. 提取成功 → 调用「机酒推荐」Tool
-4. 返回推荐 → 前端渲染为可点击卡片
-5. 用户选择 → 点击预订 → /api/order/submit
-6. 业务处理 → TMC 公对公扣款 → OA 财务入账
-7. 完成闭环 → 返回确认消息
+2. Intent Classifier 判断意图 → greeting/chat/book/recommend
+3. Agent 根据意图处理 → 调用信息抽取 Tool
+4. 信息完整 → 流式调用推荐 Tool → 分段返回卡片
+5. 前端渲染 → 推荐卡片可滚动、可关闭
+6. 用户选择 → 点击预订 → /api/order/submit
+7. 业务处理 → TMC 公对公扣款 → OA 财务入账
+8. 完成闭环 → 返回确认消息
 ```
 
 ---
@@ -165,10 +170,11 @@ enterprise-travel-agent/
 ├── README_EN.md                # English docs
 │
 ├── backend/                    # 后端核心
-│   ├── state.py                # Pydantic 状态定义
-│   ├── graph.py                # LangGraph 状态机
-│   ├── config.py               # 配置管理
-│   └── llm.py                  # LLM 接口封装
+│   ├── state.py               # Pydantic 状态定义
+│   ├── graph.py               # LangGraph 状态机 + Agent
+│   ├── config.py              # 配置管理
+│   ├── llm.py                 # LLM 接口封装
+│   └── intent_classifier.py   # 意图识别分类器
 │
 ├── tools/                      # 工具层
 │   ├── information_extraction.py  # 信息抽取
@@ -179,7 +185,7 @@ enterprise-travel-agent/
 └── frontend/                   # 前端页面
     ├── index.html              # 主页面
     ├── style.css               # 样式
-    └── app.js                  # 前端逻辑
+    └── app.js                 # 前端逻辑
 ```
 
 ---
@@ -188,7 +194,7 @@ enterprise-travel-agent/
 
 ### 1. 流式聊天 `POST /api/chat/stream`
 
-SSE 流式响应，推荐使用
+SSE 流式响应，支持推荐卡片分段输出
 
 ```javascript
 // Request
@@ -202,13 +208,34 @@ const res = await fetch('/api/chat/stream', {
   })
 });
 
-// Response (SSE)
+// Response (SSE) - 文本消息
 data: {"type": "start", "thread_id": "..."}
 data: {"type": "message", "content": "正在处理..."}
 data: {"type": "message", "content": "为您找到了..."}
-data: {"type": "recommendations", "data": [...]}
-data: {"type": "done"}
+data: {"type": "clear"}
+
+// Response (SSE) - 流式推荐卡片
+data: {"type": "recommendation_category", "category": "train", "title": "🚄 高铁/动车"}
+data: {"type": "recommendation", "data": {...}}
+data: {"type": "recommendation", "data": {...}}
+data: {"type": "recommendation_category", "category": "flight", "title": "✈️ 航班"}
+data: {"type": "recommendation", "data": {...}}
+data: {"type": "recommendations_done"}
+data: {"type": "done", "step": "recommended"}
 ```
+
+**SSE 事件类型：**
+| 类型 | 说明 |
+|------|------|
+| `start` | 会话开始，返回 thread_id |
+| `status` | 处理状态（如"正在理解您的需求..."） |
+| `message` | 助手回复文本 |
+| `clear` | 清除占位消息 |
+| `recommendation_category` | 推荐分类标题 |
+| `recommendation` | 单个推荐卡片 |
+| `recommendations_done` | 推荐展示完成 |
+| `done` | 会话结束 |
+| `error` | 错误信息 |
 
 ### 2. 普通聊天 `POST /api/chat`
 
@@ -271,8 +298,18 @@ python -c "from main import app; from fastapi.testclient import TestClient; c=Te
 ### 添加新功能
 
 1. 在 `tools/` 目录下创建新的 Tool
-2. 在 `backend/graph.py` 中注册 Tool
-3. 在 `agent_node` 中添加处理逻辑
+2. 在 `backend/graph.py` 的 `agent_node` 中添加处理逻辑
+3. 前端会自动处理新的 SSE 事件类型
+
+### 意图识别
+
+意图分类器 `backend/intent_classifier.py` 支持以下意图：
+- `greeting`: 用户问候
+- `chat`: 闲聊/一般问题
+- `trip_query`: 差旅查询
+- `book`: 预订
+- `cancel`: 取消
+- `expense`: 报销
 
 ---
 
