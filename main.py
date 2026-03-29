@@ -12,8 +12,12 @@ from backend.schemas.state import TravelState
 from backend.graph import travel_graph
 from backend.config import settings
 from tools.tmc_api import TMCApiTool
-
-from langgraph.checkpoint.memory import MemorySaver
+from backend.schemas.events import SSEEvent, ProcessingStatus
+from backend.utils.state import (
+    create_state_from_existing,
+    create_initial_state,
+    convert_state_to_dict,
+)
 
 app = FastAPI(title="Enterprise Travel Intelligent Agent")
 
@@ -62,14 +66,14 @@ async def root():
 async def generate_chat_response(
     request: ChatRequest, thread_id: str
 ) -> AsyncGenerator[str, None]:
-    """生成流式响应"""
+    """Generate streaming response"""
     config = {"configurable": {"thread_id": thread_id}}
 
-    # 立即发送开始消息，让用户知道请求已接收
-    yield f"data: {json.dumps({'type': 'start', 'thread_id': thread_id, 'message': '正在连接...'})}\n\n"
+    # Send start event
+    yield f"data: {SSEEvent.start(thread_id, ProcessingStatus.CONNECTING)}\n\n"
     await asyncio.sleep(0.1)
 
-    # 获取现有状态
+    # Get existing state
     existing_state = None
     try:
         existing = travel_graph.get_state(config)
@@ -78,129 +82,76 @@ async def generate_chat_response(
     except Exception as e:
         print(f"获取历史状态失败: {e}")
 
-    # 发送状态消息（不会显示在聊天框）
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在连接...'})}\n\n"
+    # Send status
+    yield f"data: {SSEEvent.status(ProcessingStatus.CONNECTING)}\n\n"
     await asyncio.sleep(0.1)
 
-    # 构建状态
+    # Build state
     if existing_state:
         new_messages = existing_state.get("messages", []) + [
             {"role": "user", "content": request.message}
         ]
-
-        from backend.state import TripInfo, OrderInfo
-
-        trip_data = existing_state.get("trip", {})
-        # 安全处理 trip，可能是 dict、Pydantic model 或其他
-        try:
-            if hasattr(trip_data, "model_dump"):
-                trip_dict = trip_data.model_dump()
-            elif isinstance(trip_data, dict):
-                trip_dict = trip_data
-            else:
-                trip_dict = {}
-
-            # 处理 date 字段的序列化问题
-            if "date" in trip_dict and trip_dict["date"]:
-                pass
-            trip = TripInfo(**trip_dict)
-        except Exception as e:
-            print(f"创建 TripInfo 失败: {e}, trip_data: {trip_data}")
-            trip = TripInfo()
-
-        try:
-            order_data = existing_state.get("order", {})
-            if hasattr(order_data, "model_dump"):
-                order = OrderInfo(**order_data.model_dump())
-            elif isinstance(order_data, dict):
-                order = OrderInfo(**order_data)
-            else:
-                order = OrderInfo()
-        except:
-            order = OrderInfo()
-
-        state = TravelState(
+        state = create_state_from_existing(
+            existing_state=existing_state,
+            new_messages=new_messages,
+            last_message=request.message,
             user_id=request.user_id,
             thread_id=thread_id,
-            messages=new_messages,
-            last_message=request.message,
-            trip=trip,
-            order=order,
-            extracted=existing_state.get("extracted", False),
-            need_recommendation=existing_state.get("need_recommendation", False),
-            current_step=existing_state.get("current_step", "initial"),
-            recommendations=existing_state.get("recommendations", []),
-            conversation_summary=existing_state.get("conversation_summary"),
         )
     else:
-        state = TravelState(
+        state = create_initial_state(
+            message=request.message,
             user_id=request.user_id,
             thread_id=thread_id,
-            messages=[{"role": "user", "content": request.message}],
-            last_message=request.message,
         )
 
-    # 流式输出各阶段状态
-    yield f"data: {json.dumps({'type': 'status', 'message': '🤔 正在理解您的需求...'})}\n\n"
+    # Stream processing status
+    yield f"data: {SSEEvent.status(ProcessingStatus.UNDERSTANDING)}\n\n"
     await asyncio.sleep(0.2)
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '🔍 正在提取出行信息（出发地、目的地、日期）...'})}\n\n"
+    yield f"data: {SSEEvent.status(ProcessingStatus.EXTRACTING)}\n\n"
     await asyncio.sleep(0.2)
 
     try:
         final_state = travel_graph.invoke(state.model_dump(), config)
+        final_state_dict = convert_state_to_dict(final_state)
 
-        # 转换为 dict 用于后续处理
-        final_state_dict = {}
-        for key, value in final_state.items():
-            if hasattr(value, "model_dump"):
-                final_state_dict[key] = value.model_dump()
-            else:
-                final_state_dict[key] = value
-
-        # 检查是否需要日期解析
-        need_date_llm = False
+        # Check if need date parsing
         trip_info = final_state_dict.get("trip", {})
-        if isinstance(trip_info, dict):
-            if trip_info.get("date") is None:
-                need_date_llm = True
-
-        if need_date_llm:
-            yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 解析日期...'})}\n\n"
+        if isinstance(trip_info, dict) and not trip_info.get("date"):
+            yield f"data: {SSEEvent.status(ProcessingStatus.PARSING_DATE)}\n\n"
             await asyncio.sleep(0.2)
 
+        # Check if need recommendations
         if final_state_dict.get("need_recommendation") and not final_state_dict.get(
             "recommendations"
         ):
-            yield f"data: {json.dumps({'type': 'status', 'message': '🚄 正在搜索高铁/动车...'})}\n\n"
+            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_TRAIN)}\n\n"
             await asyncio.sleep(0.3)
 
-            yield f"data: {json.dumps({'type': 'status', 'message': '✈️ 正在搜索航班...'})}\n\n"
+            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_FLIGHT)}\n\n"
             await asyncio.sleep(0.3)
 
-            yield f"data: {json.dumps({'type': 'status', 'message': '🏨 正在搜索酒店...'})}\n\n"
+            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_HOTEL)}\n\n"
             await asyncio.sleep(0.3)
 
-            yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 智能推荐（根据性价比）...'})}\n\n"
+            yield f"data: {SSEEvent.status(ProcessingStatus.AI_RECOMMENDING)}\n\n"
             await asyncio.sleep(0.3)
 
-            yield f"data: {json.dumps({'type': 'status', 'message': '✨ 正在生成推荐理由...'})}\n\n"
+            yield f"data: {SSEEvent.status(ProcessingStatus.GENERATING_REASONS)}\n\n"
             await asyncio.sleep(0.2)
 
-        # 检查 trip.date 是否存在
+        # Check trip date again
         trip_data = final_state_dict.get("trip")
-        if trip_data and isinstance(trip_data, dict):
-            if trip_data.get("date") is None:
-                yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 解析日期...'})}\n\n"
-                await asyncio.sleep(0.2)
+        if trip_data and isinstance(trip_data, dict) and not trip_data.get("date"):
+            yield f"data: {SSEEvent.status(ProcessingStatus.PARSING_DATE)}\n\n"
+            await asyncio.sleep(0.2)
 
-        # 清除状态消息，准备显示回复
-        yield f"data: {json.dumps({'type': 'clear'})}\n\n"
+        # Clear and output message
+        yield f"data: {SSEEvent.clear()}\n\n"
 
-        # 只输出最新的助手消息，不重复历史
+        # Get latest assistant message
         all_messages = final_state_dict.get("messages", [])
-
-        # 找到最新的一条助手消息
         latest_response = None
         for msg in reversed(all_messages):
             if msg.get("role") == "assistant":
@@ -208,56 +159,50 @@ async def generate_chat_response(
                 break
 
         if latest_response:
-            # 逐段输出，模拟打字效果
             for i in range(0, len(latest_response), 20):
                 chunk = latest_response[i : i + 20]
-                yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
+                yield f"data: {SSEEvent.message(chunk)}\n\n"
                 await asyncio.sleep(0.03)
 
-        # 流式输出推荐结果 - 分段返回
+        # Stream recommendations
         recommendations = final_state_dict.get("recommendations", [])
         if recommendations:
-            # 按类型分组
             trains = [r for r in recommendations if r.get("type") == "train"]
             flights = [r for r in recommendations if r.get("type") == "flight"]
             hotels = [r for r in recommendations if r.get("type") == "hotel"]
 
-            # 流式输出高铁
             if trains:
-                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'train', 'title': '🚄 高铁/动车'})}\n\n"
+                yield f"data: {SSEEvent.recommendation_category('train', '🚄 高铁/动车')}\n\n"
                 await asyncio.sleep(0.1)
                 for rec in trains:
-                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
                     await asyncio.sleep(0.15)
 
-            # 流式输出航班
             if flights:
-                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'flight', 'title': '✈️ 航班'})}\n\n"
+                yield f"data: {SSEEvent.recommendation_category('flight', '✈️ 航班')}\n\n"
                 await asyncio.sleep(0.1)
                 for rec in flights:
-                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
                     await asyncio.sleep(0.15)
 
-            # 流式输出酒店
             if hotels:
-                yield f"data: {json.dumps({'type': 'recommendation_category', 'category': 'hotel', 'title': '🏨 酒店'})}\n\n"
+                yield f"data: {SSEEvent.recommendation_category('hotel', '🏨 酒店')}\n\n"
                 await asyncio.sleep(0.1)
                 for rec in hotels:
-                    yield f"data: {json.dumps({'type': 'recommendation', 'data': rec})}\n\n"
+                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
                     await asyncio.sleep(0.15)
 
-            # 推荐完成信号
-            yield f"data: {json.dumps({'type': 'recommendations_done'})}\n\n"
+            yield f"data: {SSEEvent.recommendations_done()}\n\n"
 
-        yield f"data: {json.dumps({'type': 'done', 'step': final_state_dict.get('current_step', 'initial')})}\n\n"
+        yield f"data: {SSEEvent.done(final_state_dict.get('current_step', 'initial'))}\n\n"
 
     except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        yield f"data: {SSEEvent.error(str(e))}\n\n"
 
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """流式聊天接口"""
+    """Streaming chat endpoint"""
     thread_id = request.thread_id or str(uuid.uuid4())
 
     return StreamingResponse(
@@ -267,14 +212,9 @@ async def chat_stream(request: ChatRequest):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            "X-Thread-Id": thread_id,  # 返回 thread_id
+            "X-Thread-Id": thread_id,
         },
     )
-
-
-@app.get("/")
-async def root():
-    return {"message": "Enterprise Travel Agent System API"}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -282,7 +222,6 @@ async def chat(request: ChatRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Try to get existing state
     existing_state = None
     try:
         existing = travel_graph.get_state(config)
@@ -292,45 +231,21 @@ async def chat(request: ChatRequest):
         print(f"获取历史状态失败: {e}")
 
     if existing_state:
-        # Continue existing conversation
         new_messages = existing_state.get("messages", []) + [
             {"role": "user", "content": request.message}
         ]
-
-        # Build updated state
-        from backend.state import TripInfo, OrderInfo
-
-        trip_data = existing_state.get("trip", {})
-        if isinstance(trip_data, dict):
-            trip = TripInfo(**trip_data)
-        else:
-            trip = trip_data or TripInfo()
-
-        order_data = existing_state.get("order", {})
-        if isinstance(order_data, dict):
-            order = OrderInfo(**order_data)
-        else:
-            order = order_data or OrderInfo()
-
-        state = TravelState(
+        state = create_state_from_existing(
+            existing_state=existing_state,
+            new_messages=new_messages,
+            last_message=request.message,
             user_id=request.user_id,
             thread_id=thread_id,
-            messages=new_messages,
-            last_message=request.message,
-            trip=trip,
-            order=order,
-            extracted=existing_state.get("extracted", False),
-            need_recommendation=existing_state.get("need_recommendation", False),
-            current_step=existing_state.get("current_step", "initial"),
-            recommendations=existing_state.get("recommendations", []),
         )
     else:
-        # New conversation
-        state = TravelState(
+        state = create_initial_state(
+            message=request.message,
             user_id=request.user_id,
             thread_id=thread_id,
-            messages=[{"role": "user", "content": request.message}],
-            last_message=request.message,
         )
 
     final_state = travel_graph.invoke(state.model_dump(), config)
@@ -345,9 +260,8 @@ async def chat(request: ChatRequest):
 
 @app.post("/api/order/submit")
 async def submit_order(request: BookRequest):
-    """Handle booking submission from frontend and update LangGraph state"""
+    """Handle booking submission"""
 
-    # Extract item ID based on type
     item_id_map = {
         "train": request.train_no,
         "flight": request.flight_no,
@@ -360,7 +274,6 @@ async def submit_order(request: BookRequest):
             status_code=400, detail=f"Missing ID for type {request.type}"
         )
 
-    # 1. Use TMC API to book (company direct payment)
     tmc_tool = TMCApiTool()
     booking_result = tmc_tool._run(
         user_id=request.user_id,
@@ -376,13 +289,9 @@ async def submit_order(request: BookRequest):
     if not booking_result.success:
         raise HTTPException(status_code=500, detail=booking_result.message)
 
-    # 2. Update LangGraph state with booking information
     config = {"configurable": {"thread_id": request.thread_id}}
-
-    # Get current state
     current_state = travel_graph.get_state(config).values
 
-    # Update state with booking info
     update = {}
 
     if request.type in ["train", "flight"]:
@@ -404,10 +313,8 @@ async def submit_order(request: BookRequest):
 
     update["current_step"] = "booking"
 
-    # Continue the graph execution
     travel_graph.invoke(update, config)
 
-    # Get final state after update
     final_state = travel_graph.get_state(config).values
 
     return {
