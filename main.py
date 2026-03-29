@@ -8,7 +8,7 @@ import uvicorn
 import json
 import asyncio
 
-from backend.state import TravelState
+from backend.schemas.state import TravelState
 from backend.graph import travel_graph
 from backend.config import settings
 from tools.tmc_api import TMCApiTool
@@ -141,10 +141,10 @@ async def generate_chat_response(
         )
 
     # 流式输出各阶段状态
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在理解您的需求...'})}\n\n"
+    yield f"data: {json.dumps({'type': 'status', 'message': '🤔 正在理解您的需求...'})}\n\n"
     await asyncio.sleep(0.2)
 
-    yield f"data: {json.dumps({'type': 'status', 'message': '正在提取出行信息（出发地、目的地、日期）...'})}\n\n"
+    yield f"data: {json.dumps({'type': 'status', 'message': '🔍 正在提取出行信息（出发地、目的地、日期）...'})}\n\n"
     await asyncio.sleep(0.2)
 
     try:
@@ -166,23 +166,32 @@ async def generate_chat_response(
                 need_date_llm = True
 
         if need_date_llm:
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 解析日期...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 解析日期...'})}\n\n"
             await asyncio.sleep(0.2)
 
         if final_state_dict.get("need_recommendation") and not final_state_dict.get(
             "recommendations"
         ):
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在搜索出行方案...'})}\n\n"
-            await asyncio.sleep(0.2)
+            yield f"data: {json.dumps({'type': 'status', 'message': '🚄 正在搜索高铁/动车...'})}\n\n"
+            await asyncio.sleep(0.3)
 
-            yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 智能推荐（根据性价比）...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'message': '✈️ 正在搜索航班...'})}\n\n"
+            await asyncio.sleep(0.3)
+
+            yield f"data: {json.dumps({'type': 'status', 'message': '🏨 正在搜索酒店...'})}\n\n"
+            await asyncio.sleep(0.3)
+
+            yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 智能推荐（根据性价比）...'})}\n\n"
+            await asyncio.sleep(0.3)
+
+            yield f"data: {json.dumps({'type': 'status', 'message': '✨ 正在生成推荐理由...'})}\n\n"
             await asyncio.sleep(0.2)
 
         # 检查 trip.date 是否存在
         trip_data = final_state_dict.get("trip")
         if trip_data and isinstance(trip_data, dict):
             if trip_data.get("date") is None:
-                yield f"data: {json.dumps({'type': 'status', 'message': '正在用 AI 解析日期...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'message': '🧠 正在用 AI 解析日期...'})}\n\n"
                 await asyncio.sleep(0.2)
 
         # 清除状态消息，准备显示回复

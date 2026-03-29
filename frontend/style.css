@@ -537,8 +537,21 @@ body {
 .status-bar {
     text-align: center;
     font-size: 0.85rem;
-    color: var(--text-secondary);
+    color: var(--accent-color);
     padding-top: 8px;
+    font-weight: 500;
+    min-height: 24px;
+    transition: all 0.3s ease;
+}
+
+.status-bar.loading {
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
 }
 
 /* Responsive */

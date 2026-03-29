@@ -164,23 +164,38 @@ cd frontend && python -m http.server 8080
 enterprise-travel-agent/
 ├── main.py                      # FastAPI 入口
 ├── requirements.txt             # Python 依赖
-├── .env.example                # 环境变量示例
-├── LICENSE                      # MIT 许可证
-├── README.md                   # 中文说明
-├── README_EN.md                # English docs
+├── .env                        # 环境变量
 │
 ├── backend/                    # 后端核心
-│   ├── state.py               # Pydantic 状态定义
-│   ├── graph.py               # LangGraph 状态机 + Agent
+│   ├── __init__.py
 │   ├── config.py              # 配置管理
 │   ├── llm.py                 # LLM 接口封装
-│   └── intent_classifier.py   # 意图识别分类器
-│
-├── tools/                      # 工具层
-│   ├── information_extraction.py  # 信息抽取
-│   ├── travel_recommendation.py    # 机酒推荐
-│   ├── tmc_api.py                 # TMC 商旅 API
-│   └── oa_finance.py              # OA 财务系统
+│   │
+│   ├── schemas/               # 数据模型
+│   │   ├── __init__.py
+│   │   ├── request.py         # 请求模型
+│   │   ├── response.py        # 响应模型
+│   │   ├── state.py           # 状态模型
+│   │   └── recommendation.py  # 推荐模型
+│   │
+│   ├── agents/                # Agent 核心
+│   │   ├── __init__.py
+│   │   └── graph.py          # LangGraph 图定义
+│   │
+│   ├── nodes/                 # LangGraph 节点
+│   │   ├── __init__.py
+│   │   ├── intent_node.py    # 意图识别节点
+│   │   ├── extract_node.py   # 信息提取节点
+│   │   ├── recommend_node.py # 推荐节点
+│   │   └── chat_node.py      # 聊天响应节点
+│   │
+│   └── tools/                 # 工具层
+│       ├── base.py            # 工具基类
+│       ├── intent_classifier.py
+│       ├── information_extraction.py
+│       ├── travel_recommendation.py
+│       ├── tmc_api.py
+│       └── oa_finance.py
 │
 └── frontend/                   # 前端页面
     ├── index.html              # 主页面

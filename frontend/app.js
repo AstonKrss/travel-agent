@@ -34,6 +34,10 @@ async function sendMessage() {
     
     document.getElementById('welcomeMessage').style.display = 'none';
     
+    // 发送新消息时隐藏推荐卡片
+    document.getElementById('recommendations').style.display = 'none';
+    document.getElementById('recommendations-list').innerHTML = '';
+    
     addMessage(message, 'user');
     inputEl.value = '';
     inputEl.style.height = 'auto';
@@ -123,9 +127,12 @@ async function sendMessage() {
                         // 推荐显示完成
                         setStatus('请选择出行方案');
                     } else if (data.type === 'done') {
-                        setStatus('完成');
+                        document.getElementById('status').textContent = '✓ 完成';
+                        document.getElementById('status').classList.remove('loading');
                         messageContainer = null;
                     } else if (data.type === 'error') {
+                        document.getElementById('status').textContent = '✕ 错误';
+                        document.getElementById('status').classList.remove('loading');
                         addMessage('抱歉，出了点问题: ' + data.message, 'assistant');
                     }
                 } catch (e) {}
@@ -357,7 +364,13 @@ async function bookItem(type, id, departure, destination, date, userId, threadId
 }
 
 function setStatus(message) {
-    document.getElementById('status').textContent = message;
+    const statusEl = document.getElementById('status');
+    statusEl.textContent = message;
+    if (message) {
+        statusEl.classList.add('loading');
+    } else {
+        statusEl.classList.remove('loading');
+    }
 }
 
 function startVoiceInput() {
