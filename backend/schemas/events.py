@@ -1,41 +1,33 @@
-# backend/schemas/events.py
-"""SSE Event types for streaming responses"""
+"""SSE Events for streaming"""
 
-from enum import Enum
-from typing import Any, Dict, Optional, List
 import json
+from enum import Enum
+from typing import Any, Dict
 
 
 class SSEEventType(str, Enum):
-    """SSE event types"""
-
     START = "start"
-    STATUS = "status"
+    NODE = "node"
     MESSAGE = "message"
     CLEAR = "clear"
     RECOMMENDATION_CATEGORY = "recommendation_category"
     RECOMMENDATION = "recommendation"
     RECOMMENDATIONS_DONE = "recommendations_done"
+    APPROVAL_REQUEST = "approval_request"
     DONE = "done"
     ERROR = "error"
 
 
 class SSEEvent:
-    """SSE event builder"""
+    @staticmethod
+    def start(thread_id: str) -> str:
+        return json.dumps({"type": SSEEventType.START.value, "thread_id": thread_id})
 
     @staticmethod
-    def start(thread_id: str, message: str = "正在连接...") -> str:
+    def node(name: str, status: str = "running") -> str:
         return json.dumps(
-            {
-                "type": SSEEventType.START.value,
-                "thread_id": thread_id,
-                "message": message,
-            }
+            {"type": SSEEventType.NODE.value, "node": name, "status": status}
         )
-
-    @staticmethod
-    def status(message: str) -> str:
-        return json.dumps({"type": SSEEventType.STATUS.value, "message": message})
 
     @staticmethod
     def message(content: str) -> str:
@@ -64,7 +56,17 @@ class SSEEvent:
         return json.dumps({"type": SSEEventType.RECOMMENDATIONS_DONE.value})
 
     @staticmethod
-    def done(step: str = "initial") -> str:
+    def approval_request(reason: str) -> str:
+        return json.dumps(
+            {
+                "type": SSEEventType.APPROVAL_REQUEST.value,
+                "reason": reason,
+                "actions": ["approve", "reject"],
+            }
+        )
+
+    @staticmethod
+    def done(step: str = "complete") -> str:
         return json.dumps({"type": SSEEventType.DONE.value, "step": step})
 
     @staticmethod
@@ -72,23 +74,12 @@ class SSEEvent:
         return json.dumps({"type": SSEEventType.ERROR.value, "message": message})
 
 
-# Processing status messages for better UX
 class ProcessingStatus:
-    """User-friendly processing status messages"""
-
-    UNDERSTANDING = "🤔 正在理解您的需求..."
-    EXTRACTING = "🔍 正在提取出行信息（出发地、目的地、日期）..."
-    PARSING_DATE = "🧠 正在用 AI 解析日期..."
-    SEARCHING_TRAIN = "🚄 正在搜索高铁/动车..."
-    SEARCHING_FLIGHT = "✈️ 正在搜索航班..."
-    SEARCHING_HOTEL = "🏨 正在搜索酒店..."
-    AI_RECOMMENDING = "🧠 正在用 AI 智能推荐（根据性价比）..."
-    GENERATING_REASONS = "✨ 正在生成推荐理由..."
-    CONNECTING = "🔗 正在连接..."
-
-
-__all__ = [
-    "SSEEventType",
-    "SSEEvent",
-    "ProcessingStatus",
-]
+    UNDERSTANDING = "正在理解您的需求..."
+    EXTRACTING = "正在提取出行信息..."
+    CHECKING_POLICY = "正在检查差旅政策..."
+    PLANNING = "正在规划行程..."
+    RECOMMENDING = "正在智能推荐..."
+    WAITING_APPROVAL = "等待审批..."
+    BOOKING = "正在预订..."
+    CONNECTING = "正在连接..."

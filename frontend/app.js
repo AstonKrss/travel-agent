@@ -1,419 +1,482 @@
-const API_BASE_URL = 'http://localhost:8000';
+const API = 'http://localhost:8000';
+let threadId = null;
+let isLoading = false;
 
-let currentThreadId = null;
-let currentUserId = document.getElementById('userId').value;
+// ── Init ──────────────────────────────────────────────────────────────────
 
-document.getElementById('messageInput').addEventListener('keypress', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-    }
+document.addEventListener('DOMContentLoaded', () => {
+    const textarea = document.getElementById('msgInput');
+    const sendBtn = document.getElementById('sendBtn');
+
+    // Enter to send (Shift+Enter for newline)
+    textarea.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            send();
+        }
+    });
+
+    // Auto-resize textarea
+    textarea.addEventListener('input', function () {
+        this.style.height = 'auto';
+        this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+
+    // Tab navigation
+    document.querySelectorAll('.nav-item').forEach(item => {
+        item.addEventListener('click', e => {
+            e.preventDefault();
+            switchTab(item.dataset.tab);
+        });
+    });
+
+    // Build node progress bar
+    buildProgressBar();
+
+    // Connection indicator
+    updateConnectionStatus('idle');
 });
 
-// Auto-resize textarea
-document.getElementById('messageInput').addEventListener('input', function() {
-    this.style.height = 'auto';
-    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-});
+// ── Tab Navigation ────────────────────────────────────────────────────────
 
-document.getElementById('userId').addEventListener('change', function(e) {
-    currentUserId = e.target.value;
-});
-
-function useQuickPrompt(text) {
-    document.getElementById('messageInput').value = text;
-    sendMessage();
+function switchTab(tab) {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelector(`.nav-item[data-tab="${tab}"]`).classList.add('active');
+    document.getElementById(tab + 'Tab').classList.add('active');
+    if (tab === 'state') refreshState();
 }
 
-async function sendMessage() {
-    const inputEl = document.getElementById('messageInput');
-    const message = inputEl.value.trim();
-    const userId = document.getElementById('userId').value;
-    
-    if (!message) return;
-    
-    document.getElementById('welcomeMessage').style.display = 'none';
-    
-    // 发送新消息时隐藏推荐卡片
-    document.getElementById('recommendations').style.display = 'none';
-    document.getElementById('recommendations-list').innerHTML = '';
-    
-    addMessage(message, 'user');
-    inputEl.value = '';
-    inputEl.style.height = 'auto';
-    
-    // 不要立即设置状态，会被后续的 status 消息覆盖
-    
-    // 创建流式请求
-    const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            message: message,
-            user_id: userId,
-            thread_id: currentThreadId
-        }),
+// ── Progress Bar ───────────────────────────────────────────────────────────
+
+const NODE_STEPS = [
+    { id: 'intent',     label: '🧠 意图',     icon: '🧠' },
+    { id: 'extractor', label: '📋 提取',     icon: '📋' },
+    { id: 'tmc_query', label: '🔍 查询',     icon: '🔍' },
+    { id: 'recommend', label: '🎯 推荐',     icon: '🎯' },
+    { id: 'booker',     label: '📦 预订',     icon: '📦' },
+];
+
+let activeStepIdx = -1;
+let completedSteps = new Set();
+
+function buildProgressBar() {
+    const bar = document.getElementById('progressBar');
+    bar.innerHTML = NODE_STEPS.map((step, i) => `
+        <div class="progress-step" id="step-${step.id}">
+            <div class="step-dot"></div>
+            <span>${step.label}</span>
+        </div>
+        ${i < NODE_STEPS.length - 1 ? '<span class="step-arrow">›</span>' : ''}
+    `).join('');
+}
+
+function activateStep(nodeId) {
+    const idx = NODE_STEPS.findIndex(s => s.id === nodeId);
+    if (idx < 0) return;
+
+    // Mark previous steps done
+    for (let i = 0; i < idx; i++) {
+        const el = document.getElementById(`step-${NODE_STEPS[i].id}`);
+        if (el) { el.classList.remove('active'); el.classList.add('done'); completedSteps.add(NODE_STEPS[i].id); }
+    }
+    // Deactivate all, then activate current
+    document.querySelectorAll('.progress-step').forEach(el => el.classList.remove('active'));
+    const cur = document.getElementById(`step-${nodeId}`);
+    if (cur) cur.classList.add('active');
+    activeStepIdx = idx;
+}
+
+function completeAllSteps() {
+    NODE_STEPS.forEach(step => {
+        const el = document.getElementById(`step-${step.id}`);
+        if (el) { el.classList.remove('active'); el.classList.add('done'); }
     });
-    
-    const reader = response.body.getReader();
+    completedSteps.add('complete');
+}
+
+function resetProgressBar() {
+    document.querySelectorAll('.progress-step').forEach(el => {
+        el.classList.remove('active', 'done');
+    });
+    activeStepIdx = -1;
+    completedSteps.clear();
+}
+
+// ── Connection Status ─────────────────────────────────────────────────────
+
+function updateConnectionStatus(status) {
+    const dot = document.getElementById('connDot');
+    if (!dot) return;
+    dot.className = 'connection-dot ' + (status || 'idle');
+}
+
+// ── Messages ───────────────────────────────────────────────────────────────
+
+function hideWelcome() {
+    const wc = document.getElementById('welcomeCard');
+    if (wc) wc.style.display = 'none';
+}
+
+function addMsg(content, role = 'assistant', extraClass = '') {
+    hideWelcome();
+    const area = document.getElementById('messages');
+    const el = document.createElement('div');
+    el.className = `msg ${role}${extraClass ? ' ' + extraClass : ''}`;
+    el.textContent = content;
+    area.appendChild(el);
+    area.scrollTop = area.scrollHeight;
+    return el;
+}
+
+function setNodeStatus(text, state = '') {
+    const el = document.getElementById('nodeStatus');
+    el.textContent = text;
+    el.className = 'node-status ' + state;
+}
+
+// ── Typing Indicator ───────────────────────────────────────────────────────
+
+let typingEl = null;
+
+function showTyping() {
+    if (typingEl) return;
+    hideWelcome();
+    typingEl = document.createElement('div');
+    typingEl.className = 'typing-indicator';
+    typingEl.innerHTML = `
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <div class="typing-dot"></div>
+        <span style="font-size:11px;color:var(--text-dim);margin-left:6px;">思考中...</span>
+    `;
+    document.getElementById('messages').appendChild(typingEl);
+    scrollBottom();
+}
+
+function hideTyping() {
+    if (typingEl) { typingEl.remove(); typingEl = null; }
+}
+
+function scrollBottom() {
+    const area = document.getElementById('messages');
+    area.scrollTop = area.scrollHeight;
+}
+
+// ── Quick Prompts ─────────────────────────────────────────────────────────
+
+function usePrompt(text) {
+    document.getElementById('msgInput').value = text;
+    send();
+}
+
+// ── Send Message ────────────────────────────────────────────────────────────
+
+async function send() {
+    const input = document.getElementById('msgInput');
+    const msg = input.value.trim();
+    const userId = document.getElementById('userId').value;
+    if (!msg || isLoading) return;
+
+    isLoading = true;
+    document.getElementById('sendBtn').disabled = true;
+    hideRecPanel();
+    resetProgressBar();
+    setNodeStatus('正在连接...', 'active');
+    updateConnectionStatus('connecting');
+
+    addMsg(msg, 'user');
+    input.value = '';
+    input.style.height = 'auto';
+
+    try {
+        const resp = await fetch(`${API}/api/chat/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: msg, user_id: userId, thread_id: threadId }),
+        });
+
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+        threadId = resp.headers.get('X-Thread-Id') || threadId;
+        document.getElementById('threadId').value = threadId || '';
+        updateConnectionStatus('connected');
+
+        await processStream(resp);
+
+        setNodeStatus('✓ 完成', 'done');
+        completeAllSteps();
+    } catch (err) {
+        console.error(err);
+        setNodeStatus('✕ 连接失败', 'error');
+        addMsg('连接失败，请确认服务已启动（python main.py）', 'assistant', 'error-msg');
+        updateConnectionStatus('error');
+    } finally {
+        isLoading = false;
+        document.getElementById('sendBtn').disabled = false;
+    }
+}
+
+// ── SSE Stream Processing ─────────────────────────────────────────────────
+
+let assistantMsgEl = null;
+
+async function processStream(resp) {
+    const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let messageContainer = null;
-    
+
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
         buffer += decoder.decode(value, { stream: true });
-        
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-        
+
         for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                try {
-                    const data = JSON.parse(line.slice(6));
-                    
-                    if (data.type === 'start') {
-                        currentThreadId = data.thread_id || currentThreadId;
-                        setStatus('正在思考...');
-                        // 清除之前的推荐卡片
-                        document.getElementById('recommendations').style.display = 'none';
-                        document.getElementById('recommendations-list').innerHTML = '';
-                    } else if (data.type === 'status') {
-                        // 显示状态消息，不创建消息容器
-                        setStatus(data.message);
-                    } else if (data.type === 'message') {
-                        // 跳过重复的空消息
-                        if (!data.content || data.content.trim() === '') {
-                            continue;
-                        }
-                        
-                        // 检查是否与最后一条消息相同，避免重复
-                        const messages = document.querySelectorAll('.message.assistant');
-                        const lastMsg = messages[messages.length - 1];
-                        if (lastMsg && lastMsg.textContent === data.content) {
-                            continue;
-                        }
-                        
-                        // 如果还没有消息容器，创建并添加到界面
-                        if (!messageContainer) {
-                            const messagesContainer = document.getElementById('messages');
-                            messageContainer = document.createElement('div');
-                            messageContainer.className = 'message assistant';
-                            messageContainer.textContent = '';
-                            messagesContainer.appendChild(messageContainer);
-                        }
-                        // 追加内容
-                        messageContainer.textContent += data.content;
-                        setStatus('正在输入...');
-                    } else if (data.type === 'clear') {
-                        // 清除占位消息
-                        if (messageContainer) {
-                            messageContainer.remove();
-                            messageContainer = null;
-                        }
-                    } else if (data.type === 'recommendation_category') {
-                        // 显示推荐分类标题
-                        document.getElementById('recommendations').style.display = 'block';
-                        displayRecommendationCategory(data.category, data.title);
-                    } else if (data.type === 'recommendation') {
-                        // 流式显示单个推荐卡片
-                        document.getElementById('recommendations').style.display = 'block';
-                        displaySingleRecommendation(data.data, userId, currentThreadId);
-                    } else if (data.type === 'recommendations_done') {
-                        // 推荐显示完成
-                        setStatus('请选择出行方案');
-                    } else if (data.type === 'done') {
-                        document.getElementById('status').textContent = '✓ 完成';
-                        document.getElementById('status').classList.remove('loading');
-                        messageContainer = null;
-                    } else if (data.type === 'error') {
-                        document.getElementById('status').textContent = '✕ 错误';
-                        document.getElementById('status').classList.remove('loading');
-                        addMessage('抱歉，出了点问题: ' + data.message, 'assistant');
-                    }
-                } catch (e) {}
-            }
+            if (!line.startsWith('data: ')) continue;
+            try {
+                const data = JSON.parse(line.slice(6));
+                await handleSSEEvent(data);
+            } catch (_) { /* skip malformed */ }
         }
     }
-    
-    scrollToBottom();
 }
 
-function addMessage(content, role) {
-    const messagesContainer = document.getElementById('messages');
-    const messageEl = document.createElement('div');
-    messageEl.className = `message ${role}`;
-    messageEl.textContent = content;
-    messagesContainer.appendChild(messageEl);
-    scrollToBottom();
-}
+async function handleSSEEvent(data) {
+    const { type } = data;
 
-function displayRecommendations(recommendations, userId, threadId) {
-    const container = document.getElementById('recommendations');
-    container.innerHTML = '';
-    
-    recommendations.forEach(rec => {
-        const card = document.createElement('div');
-        card.className = 'recommendation-card';
-        
-        let content = `
-            <span class="type-badge ${rec.type}">${rec.type.toUpperCase()}</span>
-            <h3>${rec.name}</h3>
-        `;
-        
-        if (rec.departure && rec.destination) {
-            content += `
-                <div class="info-row">
-                    <span>From</span>
-                    <span>${rec.departure}</span>
-                </div>
-                <div class="info-row">
-                    <span>To</span>
-                    <span>${rec.destination}</span>
-                </div>
-            `;
-        }
-        
-        if (rec.departure_time && rec.arrival_time) {
-            content += `
-                <div class="info-row">
-                    <span>Departure</span>
-                    <span>${rec.departure_time}</span>
-                </div>
-                <div class="info-row">
-                    <span>Arrival</span>
-                    <span>${rec.arrival_time}</span>
-                </div>
-                <div class="info-row">
-                    <span>Duration</span>
-                    <span>${rec.duration}</span>
-                </div>
-            `;
-        }
-        
-        if (rec.details && rec.details.rating) {
-            content += `
-                <div class="info-row">
-                    <span>Rating</span>
-                    <span>${rec.details.rating} ⭐</span>
-                </div>
-            `;
-        }
-        
-        content += `
-            <div class="price">¥${rec.price.toFixed(2)}</div>
-            <button class="book-btn" onclick="bookItem('${rec.type}', '${rec.id}', '${rec.departure || ''}', '${rec.destination || ''}', '${rec.date || ''}', '${userId}', '${threadId}')">
-                Book Now
-            </button>
-        `;
-        
-        card.innerHTML = content;
-        container.appendChild(card);
-    });
-    
-    scrollToBottom();
-}
-
-function displayRecommendationCategory(category, title) {
-    const container = document.getElementById('recommendations-list');
-    const categoryEl = document.createElement('div');
-    categoryEl.className = 'recommendation-category';
-    categoryEl.textContent = title;
-    container.appendChild(categoryEl);
-    scrollToBottom();
-}
-
-function displaySingleRecommendation(rec, userId, threadId) {
-    const container = document.getElementById('recommendations-list');
-    const card = document.createElement('div');
-    card.className = 'recommendation-card';
-    
-    let content = `
-        <span class="type-badge ${rec.type}">${rec.type.toUpperCase()}</span>
-        <h3>${rec.name}</h3>
-    `;
-    
-    if (rec.departure && rec.destination) {
-        content += `
-            <div class="info-row">
-                <span>From</span>
-                <span>${rec.departure}</span>
-            </div>
-            <div class="info-row">
-                <span>To</span>
-                <span>${rec.destination}</span>
-            </div>
-        `;
-    }
-    
-    if (rec.departure_time && rec.arrival_time) {
-        content += `
-            <div class="info-row">
-                <span>Departure</span>
-                <span>${rec.departure_time}</span>
-            </div>
-            <div class="info-row">
-                <span>Arrival</span>
-                <span>${rec.arrival_time}</span>
-            </div>
-            <div class="info-row">
-                <span>Duration</span>
-                <span>${rec.duration}</span>
-            </div>
-        `;
-    }
-    
-    if (rec.details && rec.details.rating) {
-        content += `
-            <div class="info-row">
-                <span>Rating</span>
-                <span>${rec.details.rating} ⭐</span>
-            </div>
-        `;
-    }
-    
-    content += `
-        <div class="price">¥${rec.price.toFixed(2)}</div>
-        <button class="book-btn" onclick="bookItem('${rec.type}', '${rec.id}', '${rec.departure || ''}', '${rec.destination || ''}', '${rec.date || ''}', '${userId}', '${threadId}')">
-            Book Now
-        </button>
-    `;
-    
-    card.innerHTML = content;
-    card.style.animation = 'slideIn 0.3s ease-out';
-    container.appendChild(card);
-    scrollToBottom();
-}
-
-function createRecommendationCard(rec, userId, threadId) {
-    const card = document.createElement('div');
-    card.className = 'recommendation-card-inline';
-    
-    let content = `
-        <span class="type-badge ${rec.type}">${rec.type.toUpperCase()}</span>
-        <span class="rec-name">${rec.name}</span>
-    `;
-    
-    if (rec.departure_time && rec.arrival_time) {
-        content += `
-            <span class="rec-time">${rec.departure_time} → ${rec.arrival_time}</span>
-        `;
-    }
-    
-    if (rec.duration) {
-        content += `<span class="rec-duration">${rec.duration}</span>`;
-    }
-    
-    content += `<span class="rec-price">¥${rec.price.toFixed(2)}</span>`;
-    
-    card.innerHTML = content;
-    return card;
-}
-
-async function bookItem(type, id, departure, destination, date, userId, threadId) {
-    const requestData = {
-        action: "book",
-        type: type,
-        user_id: userId,
-        thread_id: threadId,
-        departure: departure || null,
-        destination: destination || null,
-        date: date || null
-    };
-    
-    if (type === 'train') {
-        requestData.train_no = id;
-    } else if (type === 'flight') {
-        requestData.flight_no = id;
-    } else if (type === 'hotel') {
-        requestData.hotel_id = id;
-    }
-    
-    setStatus('Processing booking...');
-    
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/order/submit`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestData),
-        });
-        
-        const result = await response.json();
-        
-        if (result.success) {
-            addMessage(`✅ ${result.message}`, 'assistant');
-            setStatus(`Booking completed. Order ID: ${result.order_id}`);
-            document.getElementById('recommendations').innerHTML = '';
-        } else {
-            alert('Booking failed: ' + result.message);
-            setStatus('Booking failed');
-        }
-    } catch (error) {
-        console.error('Error:', error);
-        alert('Error processing booking');
-        setStatus('Error: Booking failed');
-    }
-    
-    scrollToBottom();
-}
-
-function setStatus(message) {
-    const statusEl = document.getElementById('status');
-    statusEl.textContent = message;
-    if (message) {
-        statusEl.classList.add('loading');
-    } else {
-        statusEl.classList.remove('loading');
-    }
-}
-
-function startVoiceInput() {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-        alert('Speech recognition is not supported in your browser');
+    if (type === 'start') {
+        threadId = data.thread_id || threadId;
+        setNodeStatus('已连接', 'active');
         return;
     }
-    
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    
-    recognition.lang = 'zh-CN';
-    recognition.interimResults = false;
-    
-    const voiceBtn = document.getElementById('voiceBtn');
-    voiceBtn.classList.add('recording');
-    setStatus('Listening... speak now');
-    
-    recognition.onresult = function(event) {
-        const transcript = event.results[0][0].transcript;
-        document.getElementById('messageInput').value = transcript;
-        setStatus('Voice captured');
-    };
-    
-    recognition.onend = function() {
-        voiceBtn.classList.remove('recording');
-    };
-    
-    recognition.onerror = function(event) {
-        console.error('Speech recognition error', event.error);
-        setStatus('Error: ' + event.error);
-        voiceBtn.classList.remove('recording');
-    };
-    
-    recognition.start();
+
+    if (type === 'node') {
+        activateStep(data.node);
+        const labels = {
+            intent: '正在识别意图...',
+            chat: '正在回复...',
+            extractor: '正在提取信息...',
+            tmc_query: '正在查询方案...',
+            recommend: '正在智能推荐...',
+            booker: '正在执行预订...',
+        };
+        setNodeStatus(labels[data.node] || `执行 ${data.node}...`, 'active');
+        showTyping();
+        return;
+    }
+
+    if (type === 'message') {
+        hideTyping();
+        if (!assistantMsgEl) {
+            assistantMsgEl = addMsg('', 'assistant');
+        }
+        assistantMsgEl.textContent += data.content;
+        scrollBottom();
+        return;
+    }
+
+    if (type === 'recommendation_category') {
+        hideTyping();
+        assistantMsgEl = null;
+        showRecPanel();
+        const catEl = document.createElement('div');
+        catEl.className = 'rec-cat-label';
+        catEl.textContent = data.title;
+        document.getElementById('recList').appendChild(catEl);
+        return;
+    }
+
+    if (type === 'recommendation') {
+        hideTyping();
+        assistantMsgEl = null;
+        showRecPanel();
+        addRecCard(data.data);
+        return;
+    }
+
+    if (type === 'recommendations_done') {
+        setNodeStatus('请选择出行方案', '');
+        return;
+    }
+
+    if (type === 'approval_request') {
+        hideTyping();
+        assistantMsgEl = null;
+        const area = document.getElementById('messages');
+        const el = document.createElement('div');
+        el.className = 'msg';
+        el.style.cssText = 'background:var(--orange-dim);border:1px solid rgba(255,183,77,0.3);color:var(--orange);border-radius:12px;';
+        el.innerHTML = `
+            <strong>⚠️ 需要审批</strong><br><br>${data.reason}
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button onclick="handleApproval('approve')" style="
+                    flex:1;padding:8px;border:none;border-radius:6px;
+                    background:var(--green);color:#fff;font-size:12px;font-weight:600;cursor:pointer;
+                ">✅ 批准</button>
+                <button onclick="handleApproval('reject')" style="
+                    flex:1;padding:8px;border:none;border-radius:6px;
+                    background:var(--red);color:#fff;font-size:12px;font-weight:600;cursor:pointer;
+                ">❌ 拒绝</button>
+            </div>`;
+        area.appendChild(el);
+        scrollBottom();
+        return;
+    }
+
+    if (type === 'done') {
+        hideTyping();
+        setNodeStatus('✓ 完成', 'done');
+        assistantMsgEl = null;
+        return;
+    }
+
+    if (type === 'error') {
+        hideTyping();
+        addMsg('错误: ' + data.message, 'assistant', 'error-msg');
+        assistantMsgEl = null;
+        setNodeStatus('✕ 错误', 'error');
+        return;
+    }
+
+    if (type === 'clear') {
+        hideTyping();
+        assistantMsgEl = null;
+        return;
+    }
 }
 
-function hideRecommendations() {
-    document.getElementById('recommendations').style.display = 'none';
-    document.getElementById('recommendations-list').innerHTML = '';
+// ── Recommendations ────────────────────────────────────────────────────────
+
+function showRecPanel() {
+    const panel = document.getElementById('recPanel');
+    panel.style.display = 'block';
 }
 
-function scrollToBottom() {
-    const container = document.getElementById('chatContainer');
-    container.scrollTop = container.scrollHeight;
+function hideRecPanel() {
+    document.getElementById('recPanel').style.display = 'none';
+    document.getElementById('recList').innerHTML = '';
+}
+
+function addRecCard(rec) {
+    const list = document.getElementById('recList');
+    const userId = document.getElementById('userId').value;
+
+    const card = document.createElement('div');
+    card.className = 'rec-card';
+    card.dataset.id = rec.id;
+    card.dataset.type = rec.type;
+
+    const score = rec.score || 0;
+    const scorePct = Math.round(Math.min(score / 100, 1) * 100);
+
+    const typeLabel = { train: '高铁', flight: '航班', hotel: '酒店' }[rec.type] || rec.type;
+
+    let extras = '';
+    if (rec.departure_time && rec.arrival_time) {
+        extras += `<div class="rec-detail-row"><span class="icon">🕐</span>${rec.departure_time} → ${rec.arrival_time} ${rec.duration ? '· ' + rec.duration : ''}</div>`;
+    }
+    if (rec.details) {
+        if (rec.details.seat_class) extras += `<div class="rec-detail-row"><span class="icon">💺</span>${rec.details.seat_class}</div>`;
+        if (rec.details.rating) extras += `<div class="rec-detail-row"><span class="icon">⭐</span>评分 ${rec.details.rating}</div>`;
+        if (rec.details.breakfast !== undefined) extras += `<div class="rec-detail-row"><span class="icon">🍳</span>${rec.details.breakfast ? '含早餐' : '不含早餐'}</div>`;
+        if (rec.details.aircraft) extras += `<div class="rec-detail-row"><span class="icon">✈</span>${rec.details.aircraft}</div>`;
+    }
+    if (rec.reason) {
+        extras += `<div class="rec-detail-row" style="color:var(--accent);font-size:11px;"><span class="icon">💡</span>${rec.reason}</div>`;
+    }
+
+    card.innerHTML = `
+        <div class="rec-card-top">
+            <span class="badge ${rec.type}">${typeLabel}</span>
+            <div class="score-badge">
+                <div class="score-bar"><div class="score-fill" style="width:${scorePct}%"></div></div>
+                <span>${score.toFixed(1)}</span>
+            </div>
+        </div>
+        <h4>${rec.name}</h4>
+        ${rec.departure && rec.destination ? `<div class="rec-detail-row"><span class="icon">📍</span>${rec.departure} → ${rec.destination}</div>` : ''}
+        ${extras}
+        <div class="rec-price">
+            <span class="yen">¥</span>
+            <span class="amount">${Number(rec.price).toLocaleString()}</span>
+            <span class="unit">${rec.type === 'hotel' ? '/晚' : ''}</span>
+        </div>
+        <button class="book-btn" onclick="bookItem('${rec.type}','${rec.id}','${userId}','${threadId}')">
+            立即预订
+        </button>
+    `;
+
+    card.addEventListener('click', e => {
+        if (e.target.classList.contains('book-btn')) return;
+        document.querySelectorAll('.rec-card').forEach(c => c.classList.remove('selected'));
+        card.classList.toggle('selected');
+    });
+
+    list.appendChild(card);
+}
+
+// ── Booking ────────────────────────────────────────────────────────────────
+
+async function bookItem(type, id, userId, tId) {
+    setNodeStatus('正在预订...', 'active');
+    try {
+        const resp = await fetch(`${API}/api/book`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'book', rec_id: id, user_id: userId, thread_id: tId }),
+        });
+        const result = await resp.json();
+        if (result.success) {
+            addMsg(`✅ 预订成功！订单号: ${result.order?.order_id || 'N/A'}`, 'assistant', 'success');
+            activateStep('booker');
+            setNodeStatus('✓ 预订完成', 'done');
+            completeAllSteps();
+            hideRecPanel();
+        } else {
+            addMsg('预订失败: ' + (result.detail || '未知错误'), 'assistant', 'error-msg');
+            setNodeStatus('✕ 预订失败', 'error');
+        }
+    } catch (err) {
+        addMsg('预订请求失败: ' + err.message, 'assistant', 'error-msg');
+        setNodeStatus('✕ 预订失败', 'error');
+    }
+}
+
+// ── Approval ───────────────────────────────────────────────────────────────
+
+async function handleApproval(action) {
+    const userId = document.getElementById('userId').value;
+    try {
+        const resp = await fetch(`${API}/api/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action, user_id: userId, thread_id: threadId }),
+        });
+        const result = await resp.json();
+        addMsg(result.message, 'assistant');
+    } catch (err) {
+        addMsg('审批请求失败: ' + err.message, 'assistant', 'error-msg');
+    }
+}
+
+// ── State View ─────────────────────────────────────────────────────────────
+
+async function refreshState() {
+    if (!threadId) {
+        document.getElementById('stateDisplay').textContent = '// 暂无会话，请先发起一次对话';
+        return;
+    }
+    try {
+        const resp = await fetch(`${API}/api/state/${threadId}`);
+        const data = await resp.json();
+        document.getElementById('stateDisplay').textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+        document.getElementById('stateDisplay').textContent = '// 获取状态失败: ' + err.message;
+    }
+}
+
+function clearState() {
+    document.getElementById('stateDisplay').textContent = '// 暂无会话';
 }

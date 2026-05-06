@@ -1,212 +1,277 @@
+"""Enterprise Travel AI Agent - FastAPI Entry Point"""
+
 import uuid
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, Literal
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 import uvicorn
-import json
 import asyncio
+import os
 
-from backend.schemas.state import TravelState
-from backend.graph import travel_graph
 from backend.config import settings
-from tools.tmc_api import TMCApiTool
+from backend.agents.graph import travel_graph
+from backend.schemas.state import TravelState, TripInfo, IntentType
 from backend.schemas.events import SSEEvent, ProcessingStatus
-from backend.utils.state import (
-    create_state_from_existing,
-    create_initial_state,
-    convert_state_to_dict,
+from backend.agents.nodes.booker_node import booker_node
+
+app = FastAPI(
+    title="Enterprise Travel AI Agent",
+    description="LangGraph-powered corporate travel assistant with multi-node orchestration",
+    version="2.0.0",
 )
 
-app = FastAPI(title="Enterprise Travel Intelligent Agent")
-
-# CORS setup
-allow_origins = [settings.allowed_origin] if settings.allowed_origin != "*" else ["*"]
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=["*"]
+    if settings.allowed_origin == "*"
+    else [settings.allowed_origin],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Serve frontend static files
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+@app.get("/style.css")
+async def serve_css():
+    return FileResponse(os.path.join(FRONTEND_DIR, "style.css"))
+
+
+@app.get("/app.js")
+async def serve_js():
+    return FileResponse(os.path.join(FRONTEND_DIR, "app.js"))
+
+
+# ---------------------------------------------------------------------------
+# Request/Response models
+# ---------------------------------------------------------------------------
+
 
 class ChatRequest(BaseModel):
     message: str
-    user_id: str
+    user_id: str = "default"
     thread_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
-    messages: list
+    messages: list = []
     recommendations: list = []
-    thread_id: str
-    current_step: str
+    thread_id: str = ""
+    current_step: str = "initial"
+    intent: Optional[str] = None
 
 
 class BookRequest(BaseModel):
-    action: str
-    type: str
-    train_no: Optional[str] = None
-    flight_no: Optional[str] = None
-    hotel_id: Optional[str] = None
-    departure: Optional[str] = None
-    destination: Optional[str] = None
-    date: Optional[str] = None
+    action: str = "book"
+    rec_id: str
     user_id: str
     thread_id: str
 
 
-@app.get("/")
-async def root():
-    return {"message": "Enterprise Travel Agent System API"}
+class ApprovalRequest(BaseModel):
+    action: str  # "approve" | "reject"
+    user_id: str
+    thread_id: str
 
 
-async def generate_chat_response(
-    request: ChatRequest, thread_id: str
-) -> AsyncGenerator[str, None]:
-    """Generate streaming response"""
+# ---------------------------------------------------------------------------
+# State builder
+# ---------------------------------------------------------------------------
+
+
+def build_state(existing: Optional[dict], req: ChatRequest, thread_id: str) -> dict:
+    """Build input state for LangGraph invocation."""
+    if existing:
+        trip_data = existing.get("trip", {})
+        if isinstance(trip_data, dict):
+            trip = trip_data
+        elif hasattr(trip_data, "model_dump"):
+            trip = trip_data.model_dump()
+        else:
+            trip = {}
+
+        order_data = existing.get("order", {})
+        if isinstance(order_data, dict):
+            order = order_data
+        elif hasattr(order_data, "model_dump"):
+            order = order_data.model_dump()
+        else:
+            order = {}
+
+        existing_msgs = existing.get("messages", [])
+        return {
+            "user_id": req.user_id,
+            "thread_id": thread_id,
+            "messages": existing_msgs + [{"role": "user", "content": req.message}],
+            "last_message": req.message,
+            "trip": trip,
+            "order": order,
+            "current_step": existing.get("current_step", "initial"),
+            "intent": existing.get("intent"),
+            "booking_status": existing.get("booking_status", "pending"),
+            "recommendations": existing.get("recommendations", []),
+            "policy_violations": existing.get("policy_violations", []),
+            "requires_approval": existing.get("requires_approval", False),
+            "policy_approved": existing.get("policy_approved", False),
+            "approval_reason": existing.get("approval_reason"),
+            "node_timings": existing.get("node_timings", {}),
+            "total_tokens": existing.get("total_tokens", 0),
+            "errors": existing.get("errors", []),
+        }
+    else:
+        return {
+            "user_id": req.user_id,
+            "thread_id": thread_id,
+            "messages": [{"role": "user", "content": req.message}],
+            "last_message": req.message,
+            "trip": {},
+            "order": {},
+            "current_step": "initial",
+            "recommendations": [],
+            "policy_violations": [],
+            "requires_approval": False,
+            "policy_approved": False,
+            "node_timings": {},
+            "total_tokens": 0,
+            "errors": [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Streaming generator
+# ---------------------------------------------------------------------------
+
+
+async def stream_chat(req: ChatRequest, thread_id: str) -> AsyncGenerator[str, None]:
+    """Generate SSE streaming response using LangGraph astream."""
     config = {"configurable": {"thread_id": thread_id}}
 
-    # Send start event
-    yield f"data: {SSEEvent.start(thread_id, ProcessingStatus.CONNECTING)}\n\n"
-    await asyncio.sleep(0.1)
+    yield f"data: {SSEEvent.start(thread_id)}\n\n"
+    await asyncio.sleep(0.05)
 
     # Get existing state
-    existing_state = None
+    existing = None
     try:
-        existing = travel_graph.get_state(config)
-        if existing and existing.values:
-            existing_state = existing.values
-    except Exception as e:
-        print(f"获取历史状态失败: {e}")
+        state_snapshot = travel_graph.get_state(config)
+        if state_snapshot and state_snapshot.values:
+            existing = state_snapshot.values
+    except Exception:
+        pass
 
-    # Send status
-    yield f"data: {SSEEvent.status(ProcessingStatus.CONNECTING)}\n\n"
-    await asyncio.sleep(0.1)
+    input_state = build_state(existing, req, thread_id)
 
-    # Build state
-    if existing_state:
-        new_messages = existing_state.get("messages", []) + [
-            {"role": "user", "content": request.message}
-        ]
-        state = create_state_from_existing(
-            existing_state=existing_state,
-            new_messages=new_messages,
-            last_message=request.message,
-            user_id=request.user_id,
-            thread_id=thread_id,
-        )
-    else:
-        state = create_initial_state(
-            message=request.message,
-            user_id=request.user_id,
-            thread_id=thread_id,
-        )
+    # Node status map for UX
+    node_status_map = {
+        "intent": "🧠 正在识别意图...",
+        "chat": "💬 正在回复...",
+        "extractor": "📋 正在提取信息...",
+        "tmc_query": "📜 正在查询方案...",
+        "recommend": "🎯 正在智能推荐...",
+        "booker": "📦 正在执行预订...",
+    }
 
-    # Stream processing status
-    yield f"data: {SSEEvent.status(ProcessingStatus.UNDERSTANDING)}\n\n"
-    await asyncio.sleep(0.2)
-
-    yield f"data: {SSEEvent.status(ProcessingStatus.EXTRACTING)}\n\n"
-    await asyncio.sleep(0.2)
-
+    final_state = None
     try:
-        final_state = travel_graph.invoke(state.model_dump(), config)
-        final_state_dict = convert_state_to_dict(final_state)
-
-        # Check if need date parsing
-        trip_info = final_state_dict.get("trip", {})
-        if isinstance(trip_info, dict) and not trip_info.get("date"):
-            yield f"data: {SSEEvent.status(ProcessingStatus.PARSING_DATE)}\n\n"
-            await asyncio.sleep(0.2)
-
-        # Check if need recommendations
-        if final_state_dict.get("need_recommendation") and not final_state_dict.get(
-            "recommendations"
+        async for event in travel_graph.astream(
+            input_state, config, stream_mode="updates"
         ):
-            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_TRAIN)}\n\n"
-            await asyncio.sleep(0.3)
+            for node_name, node_output in event.items():
+                # Send node status
+                status_msg = node_status_map.get(node_name, f"正在执行 {node_name}...")
+                yield f"data: {SSEEvent.node(node_name)}\n\n"
 
-            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_FLIGHT)}\n\n"
-            await asyncio.sleep(0.3)
+                # Stream assistant messages character-by-character for chat node
+                if node_name == "chat":
+                    for msg in msgs:
+                        if msg.get("role") == "assistant":
+                            content = msg.get("content", "")
+                            for i in range(0, len(content), 10):
+                                yield f"data: {SSEEvent.message(content[i : i + 10])}\n\n"
+                                await asyncio.sleep(0.02)
 
-            yield f"data: {SSEEvent.status(ProcessingStatus.SEARCHING_HOTEL)}\n\n"
-            await asyncio.sleep(0.3)
+                # Check for approval request
+                if node_output.get("current_step") == "awaiting_approval":
+                    reason = node_output.get("approval_reason", "需要审批")
+                    yield f"data: {SSEEvent.approval_request(reason)}\n\n"
 
-            yield f"data: {SSEEvent.status(ProcessingStatus.AI_RECOMMENDING)}\n\n"
-            await asyncio.sleep(0.3)
+                # Stream recommendations
+                recs = node_output.get("recommendations", [])
+                if recs:
+                    trains = [r for r in recs if r.get("type") == "train"]
+                    flights = [r for r in recs if r.get("type") == "flight"]
+                    hotels = [r for r in recs if r.get("type") == "hotel"]
 
-            yield f"data: {SSEEvent.status(ProcessingStatus.GENERATING_REASONS)}\n\n"
-            await asyncio.sleep(0.2)
+                    if trains:
+                        yield f"data: {SSEEvent.recommendation_category('train', '🚄 高铁/动车')}\n\n"
+                        await asyncio.sleep(0.1)
+                        for r in trains:
+                            yield f"data: {SSEEvent.recommendation(r)}\n\n"
+                            await asyncio.sleep(0.1)
 
-        # Check trip date again
-        trip_data = final_state_dict.get("trip")
-        if trip_data and isinstance(trip_data, dict) and not trip_data.get("date"):
-            yield f"data: {SSEEvent.status(ProcessingStatus.PARSING_DATE)}\n\n"
-            await asyncio.sleep(0.2)
+                    if flights:
+                        yield f"data: {SSEEvent.recommendation_category('flight', '✈️ 航班')}\n\n"
+                        await asyncio.sleep(0.1)
+                        for r in flights:
+                            yield f"data: {SSEEvent.recommendation(r)}\n\n"
+                            await asyncio.sleep(0.1)
 
-        # Clear and output message
-        yield f"data: {SSEEvent.clear()}\n\n"
+                    if hotels:
+                        yield f"data: {SSEEvent.recommendation_category('hotel', '🏨 酒店')}\n\n"
+                        await asyncio.sleep(0.1)
+                        for r in hotels:
+                            yield f"data: {SSEEvent.recommendation(r)}\n\n"
+                            await asyncio.sleep(0.1)
 
-        # Get latest assistant message
-        all_messages = final_state_dict.get("messages", [])
-        latest_response = None
-        for msg in reversed(all_messages):
-            if msg.get("role") == "assistant":
-                latest_response = msg.get("content", "")
-                break
+                    yield f"data: {SSEEvent.recommendations_done()}\n\n"
 
-        if latest_response:
-            for i in range(0, len(latest_response), 20):
-                chunk = latest_response[i : i + 20]
-                yield f"data: {SSEEvent.message(chunk)}\n\n"
-                await asyncio.sleep(0.03)
+                final_state = node_output
 
-        # Stream recommendations
-        recommendations = final_state_dict.get("recommendations", [])
-        if recommendations:
-            trains = [r for r in recommendations if r.get("type") == "train"]
-            flights = [r for r in recommendations if r.get("type") == "flight"]
-            hotels = [r for r in recommendations if r.get("type") == "hotel"]
-
-            if trains:
-                yield f"data: {SSEEvent.recommendation_category('train', '🚄 高铁/动车')}\n\n"
-                await asyncio.sleep(0.1)
-                for rec in trains:
-                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
-                    await asyncio.sleep(0.15)
-
-            if flights:
-                yield f"data: {SSEEvent.recommendation_category('flight', '✈️ 航班')}\n\n"
-                await asyncio.sleep(0.1)
-                for rec in flights:
-                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
-                    await asyncio.sleep(0.15)
-
-            if hotels:
-                yield f"data: {SSEEvent.recommendation_category('hotel', '🏨 酒店')}\n\n"
-                await asyncio.sleep(0.1)
-                for rec in hotels:
-                    yield f"data: {SSEEvent.recommendation(rec)}\n\n"
-                    await asyncio.sleep(0.15)
-
-            yield f"data: {SSEEvent.recommendations_done()}\n\n"
-
-        yield f"data: {SSEEvent.done(final_state_dict.get('current_step', 'initial'))}\n\n"
+        step = (
+            final_state.get("current_step", "complete") if final_state else "complete"
+        )
+        yield f"data: {SSEEvent.done(step)}\n\n"
 
     except Exception as e:
         yield f"data: {SSEEvent.error(str(e))}\n\n"
 
 
-@app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """Streaming chat endpoint"""
-    thread_id = request.thread_id or str(uuid.uuid4())
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
+
+@app.get("/api")
+async def api_info():
+    return {
+        "name": "Enterprise Travel AI Agent",
+        "version": "2.0.0",
+        "architecture": "LangGraph Multi-Node Orchestration",
+        "nodes": [
+            "intent",
+            "chat",
+            "extractor",
+            "tmc_query",
+            "recommend",
+            "booker",
+        ],
+    }
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """SSE streaming chat with real-time node status."""
+    thread_id = req.thread_id or str(uuid.uuid4())
     return StreamingResponse(
-        generate_chat_response(request, thread_id),
+        stream_chat(req, thread_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -218,124 +283,149 @@ async def chat_stream(request: ChatRequest):
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    thread_id = request.thread_id or str(uuid.uuid4())
+async def chat(req: ChatRequest):
+    """Non-streaming chat endpoint."""
+    thread_id = req.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
-    existing_state = None
+    existing = None
     try:
-        existing = travel_graph.get_state(config)
-        if existing and existing.values:
-            existing_state = existing.values
-    except Exception as e:
-        print(f"获取历史状态失败: {e}")
+        snap = travel_graph.get_state(config)
+        if snap and snap.values:
+            existing = snap.values
+    except Exception:
+        pass
 
-    if existing_state:
-        new_messages = existing_state.get("messages", []) + [
-            {"role": "user", "content": request.message}
-        ]
-        state = create_state_from_existing(
-            existing_state=existing_state,
-            new_messages=new_messages,
-            last_message=request.message,
-            user_id=request.user_id,
-            thread_id=thread_id,
-        )
-    else:
-        state = create_initial_state(
-            message=request.message,
-            user_id=request.user_id,
-            thread_id=thread_id,
-        )
-
-    final_state = travel_graph.invoke(state.model_dump(), config)
+    input_state = build_state(existing, req, thread_id)
+    result = travel_graph.invoke(input_state, config)
 
     return ChatResponse(
-        messages=final_state["messages"],
-        recommendations=final_state.get("recommendations", []),
+        messages=result.get("messages", []),
+        recommendations=result.get("recommendations", []),
         thread_id=thread_id,
-        current_step=final_state.get("current_step", "initial"),
+        current_step=result.get("current_step", "initial"),
+        intent=result.get("intent"),
     )
 
 
-@app.post("/api/order/submit")
-async def submit_order(request: BookRequest):
-    """Handle booking submission"""
+@app.post("/api/approve")
+async def handle_approval(req: ApprovalRequest):
+    """Handle approval/rejection from user."""
+    config = {"configurable": {"thread_id": req.thread_id}}
 
-    item_id_map = {
-        "train": request.train_no,
-        "flight": request.flight_no,
-        "hotel": request.hotel_id,
-    }
+    if req.action == "approve":
+        travel_graph.update_state(
+            config,
+            {
+                "policy_approved": True,
+                "current_step": "approved",
+                "requires_approval": False,
+            },
+        )
+        return {"success": True, "message": "已批准，正在继续预订流程"}
+    else:
+        travel_graph.update_state(
+            config,
+            {
+                "policy_approved": False,
+                "current_step": "rejected",
+                "requires_approval": False,
+            },
+        )
+        return {"success": True, "message": "已取消，请调整方案后重试"}
 
-    item_id = item_id_map.get(request.type)
-    if not item_id:
+
+@app.post("/api/book", response_model=dict)
+async def handle_book(req: BookRequest):
+    """Book a specific recommendation."""
+    config = {"configurable": {"thread_id": req.thread_id}}
+
+    try:
+        snap = travel_graph.get_state(config)
+        current = snap.values if snap else {}
+    except Exception:
+        current = {}
+
+    recs = current.get("recommendations", [])
+    target = None
+    for r in recs:
+        if r.get("id") == req.rec_id:
+            target = r
+            break
+
+    if not target:
         raise HTTPException(
-            status_code=400, detail=f"Missing ID for type {request.type}"
+            status_code=404, detail=f"Recommendation {req.rec_id} not found"
         )
 
-    tmc_tool = TMCApiTool()
-    booking_result = tmc_tool._run(
-        user_id=request.user_id,
-        item_type=request.type,
-        item_id=item_id,
-        details={
-            "departure": request.departure,
-            "destination": request.destination,
-            "date": request.date,
-        },
-    )
+    # Build minimal state for the booker node (preserves checkpoint state)
+    booker_state = {
+        "user_id": req.user_id,
+        "thread_id": req.thread_id,
+        "messages": [],
+        "last_message": f"Book {req.rec_id}",
+        "recommendations": recs,
+    }
 
-    if not booking_result.success:
-        raise HTTPException(status_code=500, detail=booking_result.message)
-
-    config = {"configurable": {"thread_id": request.thread_id}}
-    current_state = travel_graph.get_state(config).values
-
-    update = {}
-
-    if request.type in ["train", "flight"]:
-        update["order"] = {
-            "order_id": booking_result.order_id,
-            "status": "booked",
-            "ticket_booked": True,
-            "hotel_booked": current_state["order"]["hotel_booked"],
-            "total_amount": booking_result.amount_charged,
-        }
-    elif request.type == "hotel":
-        update["order"] = {
-            "order_id": booking_result.order_id,
-            "status": "booked",
-            "ticket_booked": current_state["order"]["ticket_booked"],
-            "hotel_booked": True,
-            "total_amount": booking_result.amount_charged,
-        }
-
-    update["current_step"] = "booking"
-
-    travel_graph.invoke(update, config)
-
-    final_state = travel_graph.get_state(config).values
+    # Invoke only the booker node directly — avoids full graph re-run
+    try:
+        result = travel_graph.invoke_node("booker", booker_state, config)
+    except AttributeError:
+        # Fallback for older LangGraph versions
+        result = travel_graph.invoke(
+            {"user_id": req.user_id, "thread_id": req.thread_id, "messages": [], "last_message": f"Book {req.rec_id}"},
+            config,
+        )
 
     return {
         "success": True,
-        "message": booking_result.message,
-        "order_id": booking_result.order_id,
-        "amount_charged": booking_result.amount_charged,
-        "final_state": {
-            "ticket_booked": final_state["order"]["ticket_booked"],
-            "hotel_booked": final_state["order"]["hotel_booked"],
-            "current_step": final_state["current_step"],
-        },
+        "order": result.get("order", {}),
+        "current_step": result.get("current_step"),
     }
+
+
+@app.get("/")
+async def root():
+    """Serve frontend index.html"""
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": "Frontend not found. Run from project root."}
 
 
 @app.get("/api/state/{thread_id}")
 async def get_state(thread_id: str):
-    """Get current state for a thread"""
+    """Get current conversation state."""
     config = {"configurable": {"thread_id": thread_id}}
-    state = travel_graph.get_state(config).values
-    return state
+    try:
+        snap = travel_graph.get_state(config)
+        return snap.values if snap else {}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/graph")
+async def get_graph_info():
+    """Get graph structure info (for visualization)."""
+    return {
+        "nodes": [
+            "intent",
+            "chat",
+            "extractor",
+            "tmc_query",
+            "recommend",
+            "booker",
+        ],
+        "entry_point": "intent",
+        "conditional_edges": [
+            {"from": "intent", "to": ["chat", "extractor", "booker", "end"]},
+            {"from": "extractor", "to": ["tmc_query", "chat", "end"]},
+            {"from": "tmc_query", "to": ["recommend"]},
+            {"from": "recommend", "to": ["end"]},
+            {"from": "booker", "to": ["end"]},
+        ],
+        "checkpointer": "MemorySaver",
+    }
 
 
 if __name__ == "__main__":
